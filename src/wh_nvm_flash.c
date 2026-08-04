@@ -45,7 +45,7 @@ enum {
 /* MSW of state variables (nfState) must be set to this pattern when written
  * to flash to prevent hardware on certain chipsets from confusing zero values
  * with erased flash */
-static const whFlashUnit BASE_STATE = 0x1234567800000000ULL;
+#define BASE_STATE 0x1234567800000000ULL
 
 /* On-flash layout of the state of an Object or Directory*/
 typedef struct {
@@ -200,9 +200,9 @@ static int nfMemState_Read(whNvmFlashContext* context, uint32_t offset,
             return ret;
         }
 
-        state->epoch = buffer.epoch;
-        state->start = buffer.start;
-        state->count = buffer.count;
+        state->epoch = (uint32_t)WHFU_TO_U64(buffer.epoch);
+        state->start = (uint32_t)WHFU_TO_U64(buffer.start);
+        state->count = (uint32_t)WHFU_TO_U64(buffer.count);
 
         /* Used */
         state->status = NF_STATUS_USED;
@@ -383,7 +383,7 @@ static int nfPartition_ReadParseMemDirectory(whNvmFlashContext* context, int par
 static int nfPartition_ProgramEpoch(whNvmFlashContext* context,
         int partition, uint32_t epoch)
 {
-    whFlashUnit unit = BASE_STATE | epoch;
+    whFlashUnit unit = WHFU_VALUE(BASE_STATE | epoch);
 
     if ((context == NULL) || (context->cb == NULL)) {
         return WH_ERROR_BADARGS;
@@ -401,7 +401,7 @@ static int nfPartition_ProgramEpoch(whNvmFlashContext* context,
 static int nfPartition_ProgramStart(whNvmFlashContext* context,
         int partition, uint32_t start)
 {
-    whFlashUnit unit = BASE_STATE | start;
+    whFlashUnit unit = WHFU_VALUE(BASE_STATE | start);
 
     if ((context == NULL) || (context->cb == NULL)) {
         return WH_ERROR_BADARGS;
@@ -419,7 +419,7 @@ static int nfPartition_ProgramStart(whNvmFlashContext* context,
 static int nfPartition_ProgramCount(whNvmFlashContext* context,
         int partition, uint32_t count)
 {
-    whFlashUnit unit = BASE_STATE | count;
+    whFlashUnit unit = WHFU_VALUE(BASE_STATE | count);
 
     if ((context == NULL) || (context->cb == NULL)) {
         return WH_ERROR_BADARGS;
@@ -529,8 +529,8 @@ static int nfObject_ProgramBegin(whNvmFlashContext* context, int partition,
 {
     int rc = 0;
     uint32_t object_offset = 0;
-    whFlashUnit state_epoch = BASE_STATE | epoch;
-    whFlashUnit state_start = BASE_STATE | start;
+    whFlashUnit state_epoch = WHFU_VALUE(BASE_STATE | epoch);
+    whFlashUnit state_start = WHFU_VALUE(BASE_STATE | start);
 
     if (    (context == NULL) ||
             (context->cb == NULL) ||
@@ -605,7 +605,8 @@ static int nfObject_ProgramFinish(whNvmFlashContext* context, int partition,
 {
     int rc;
     uint32_t object_offset = 0;
-    whFlashUnit state_count = BASE_STATE | WHFU_BYTES2UNITS(byte_count);
+    whFlashUnit state_count = WHFU_VALUE(BASE_STATE |
+        WHFU_BYTES2UNITS(byte_count));
 
     if ((context == NULL) || (context->cb == NULL)) {
         return WH_ERROR_BADARGS;

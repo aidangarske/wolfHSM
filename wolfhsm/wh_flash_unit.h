@@ -40,8 +40,28 @@
 
 #include "wolfhsm/wh_flash.h"
 
-/* Smallest programmable unit/size.  Alignment as well */
+/* Smallest programmable unit/size. Alignment as well. Most targets program
+ * 64-bit units. Targets such as STM32H5 that require 128-bit flash writes may
+ * select WOLFHSM_CFG_FLASH_UNIT_SIZE=16. */
+#ifndef WOLFHSM_CFG_FLASH_UNIT_SIZE
+    #define WOLFHSM_CFG_FLASH_UNIT_SIZE 8
+#endif
+
+#if WOLFHSM_CFG_FLASH_UNIT_SIZE == 8
 typedef uint64_t whFlashUnit;
+    #define WHFU_VALUE(_value) ((whFlashUnit)(_value))
+    #define WHFU_TO_U64(_unit) ((uint64_t)(_unit))
+#elif WOLFHSM_CFG_FLASH_UNIT_SIZE == 16
+typedef struct whFlashUnit_t {
+    uint64_t value;
+    uint64_t padding;
+} whFlashUnit;
+    #define WHFU_VALUE(_value) \
+        ((whFlashUnit){(uint64_t)(_value), 0u})
+    #define WHFU_TO_U64(_unit) ((_unit).value)
+#else
+    #error "WOLFHSM_CFG_FLASH_UNIT_SIZE must be 8 or 16"
+#endif
 
 #define WHFU_BYTES_PER_UNIT sizeof(whFlashUnit)
 
