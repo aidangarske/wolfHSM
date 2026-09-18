@@ -39,10 +39,14 @@ typedef struct whServerContext_t whServerContext;
 #include "wolfhsm/wh_common.h"
 #include "wolfhsm/wh_comm.h"
 #include "wolfhsm/wh_keycache.h"
+#include "wolfhsm/wh_server_cert_cache.h"
 #include "wolfhsm/wh_nvm.h"
 #ifdef WOLFHSM_CFG_ENABLE_AUTHENTICATION
 #include "wolfhsm/wh_auth.h"
 #endif /* WOLFHSM_CFG_ENABLE_AUTHENTICATION */
+#ifdef WOLFHSM_CFG_HWKEYSTORE
+#include "wolfhsm/wh_hwkeystore.h"
+#endif /* WOLFHSM_CFG_HWKEYSTORE */
 #include "wolfhsm/wh_message_customcb.h"
 #include "wolfhsm/wh_log.h"
 #ifdef WOLFHSM_CFG_DMA
@@ -140,15 +144,19 @@ typedef struct {
 
 typedef struct whServerConfig_t {
     whCommServerConfig* comm_config;
-    whNvmContext*       nvm;
+    whNvmContext*       nvm; /* optional; NULL = no NVM backing */
 #ifdef WOLFHSM_CFG_ENABLE_AUTHENTICATION
     whAuthContext* auth;
 #endif /* WOLFHSM_CFG_ENABLE_AUTHENTICATION */
+#ifdef WOLFHSM_CFG_HWKEYSTORE
+    whHwKeystoreContext* hwKeystore; /* optional; NULL = no HW keystore */
+#endif                               /* WOLFHSM_CFG_HWKEYSTORE */
 
 #ifndef WOLFHSM_CFG_NO_CRYPTO
     whServerCryptoContext* crypto;
 #ifdef WOLFHSM_CFG_SHE_EXTENSION
     whServerSheContext* she;
+    whServerSheConfig*  sheConfig; /* optional; NULL = in-context UID storage */
 #endif /* WOLFHSM_CFG_SHE_EXTENSION */
 #if defined WOLF_CRYPTO_CB
     int devId;
@@ -160,6 +168,9 @@ typedef struct whServerConfig_t {
 #ifdef WOLFHSM_CFG_LOGGING
     whLogConfig* logConfig;
 #endif /* WOLFHSM_CFG_LOGGING */
+#if defined(WOLFHSM_CFG_CERTIFICATE_MANAGER) && !defined(WOLFHSM_CFG_NO_CRYPTO)
+    whServerCertConfig* certConfig; /* optional; NULL = no verify callback */
+#endif /* WOLFHSM_CFG_CERTIFICATE_MANAGER && !WOLFHSM_CFG_NO_CRYPTO */
 } whServerConfig;
 
 
@@ -169,6 +180,9 @@ struct whServerContext_t {
 #ifdef WOLFHSM_CFG_ENABLE_AUTHENTICATION
     whAuthContext* auth;
 #endif /* WOLFHSM_CFG_ENABLE_AUTHENTICATION */
+#ifdef WOLFHSM_CFG_HWKEYSTORE
+    whHwKeystoreContext* hwKeystore;
+#endif /* WOLFHSM_CFG_HWKEYSTORE */
     whCommServer  comm[1];
 #ifndef WOLFHSM_CFG_NO_CRYPTO
     whServerCryptoContext* crypto;
@@ -186,21 +200,34 @@ struct whServerContext_t {
 #ifdef WOLFHSM_CFG_LOGGING
     whLogContext log;
 #endif /* WOLFHSM_CFG_LOGGING */
+#if defined(WOLFHSM_CFG_CERTIFICATE_MANAGER) && !defined(WOLFHSM_CFG_NO_CRYPTO)
+    whServerCertContext cert; /* verify callback + verify cache */
+#endif /* WOLFHSM_CFG_CERTIFICATE_MANAGER && !WOLFHSM_CFG_NO_CRYPTO */
 };
 
 
 /** Public server context functions */
 
 /* Initialize the comms and crypto cache components.
- * Note: NVM and Crypto components must be initialized prior to Server Init
+ * Note: Crypto components must be initialized prior to Server Init. NVM, if
+ * provided, must also be initialized first; NVM is optional (see below).
  */
 
 /**
  * @brief Initializes the server context with the provided configuration.
  *
  * This function must be called before any other server functions are used on
- * the supplied context. Note that the NVM and Crypto components of the config
- * structure MUST be initialized before calling this function.
+ * the supplied context. If a Crypto component is configured it MUST be
+ * initialized before calling this function.
+ *
+ * The NVM component is OPTIONAL: config->nvm may be NULL. With no NVM backing
+ * the server still runs and crypto works through the key cache when keys are
+ * primed (cached directly or via wrapped keys). Keystore lookups that miss the
+ * cache return WH_ERROR_NOTFOUND (as if the key were absent from NVM), and
+ * operations that inherently require persistence (the NVM request API,
+ * certificate-chain verification against stored roots, counters, key commit,
+ * SHE key/seed persistence, image-signature loading) fail at runtime rather
+ * than crashing. If config->nvm is provided, behavior is unchanged.
  *
  * @param[in] server Pointer to the server context.
  * @param[in] config Pointer to the server configuration.

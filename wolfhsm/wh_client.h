@@ -25,8 +25,12 @@
  * WolfHSM Server.  All communications and state are internally managed by
  * registering a crypto callback function to be invoked synchronously when
  * wolfCrypt functions are called.  In order to specify to use the WolfHSM
- * Server for cryptographic operations, the device id WH_DEV_ID should be
- * passed into any of the wolfCrypt init functions.
+ * Server for cryptographic operations, pass the client's devId into any of
+ * the wolfCrypt init functions. Set the devId in whClientConfig.devId (0 picks
+ * the default WH_DEV_ID) and read it back with WH_CLIENT_DEVID(c). With a
+ * single client you can just pass the global WH_DEV_ID (or WH_DEV_ID_DMA for
+ * DMA only). With more than one client, give each its own devId. See
+ * WH_CLIENT_DEVID and WH_DEV_ID below.
  *
  * In addition to the offload of cryptographic functions, the WolfHSM Client
  * also exposes WolfHSM Server key management, non-volatile memory, and protocol
@@ -65,25 +69,57 @@ typedef struct whClientContext_t whClientContext;
 /* WolfCrypt types and defines */
 #include "wolfssl/wolfcrypt/types.h"
 
-/* Device Id to be registered and passed to wolfCrypt functions */
-enum WH_CLIENT_DEVID_ENUM {
-    WH_DEV_ID = 0x5748534D, /* "WHSM" */
-#ifdef WOLFHSM_CFG_DMA
-    WH_DEV_ID_DMA = 0x57444D41, /* "WDMA" */
-    WH_NUM_DEVIDS = 2
-#else
-    WH_NUM_DEVIDS = 1
+/* Default devId for wolfHSM offload; you can override the value. Every
+ * wh_Client_Init() registers it, so it works like any per-client devId
+ * (including DMA mode, see wh_Client_SetDmaMode). It is also the devId used
+ * when a client config leaves devId 0. Calls on it always go to the most
+ * recently initialized client, and any client's wh_Client_Cleanup()
+ * unregisters it, so only pass it to wolfCrypt directly when there is one
+ * client; with more, give each its own devId. New code should not use this
+ * directly; it is kept only for backwards compatibility. */
+#ifndef WH_DEV_ID
+#define WH_DEV_ID 0x5748534D /* "WHSM" */
 #endif
-};
-extern const int WH_DEV_IDS_ARRAY[WH_NUM_DEVIDS];
-#else
+
+#if WH_DEV_ID <= 0
+#error "WH_DEV_ID must be a positive, nonzero value"
+#endif
+
+#ifdef WOLFHSM_CFG_DMA
+
+/* Default devId for DMA-only wolfHSM offload; you can override the value. It
+ * is reserved, so it is not valid as whClientConfig.devId. Like WH_DEV_ID it
+ * goes to the most recently initialized client and any wh_Client_Cleanup()
+ * unregisters it, so it is for single-client use only. New code should not use
+ * this directly; it is kept only for backwards compatibility. */
+#ifndef WH_DEV_ID_DMA
+#define WH_DEV_ID_DMA 0x57444D41 /* "WDMA" */
+#endif /* WH_DEV_ID_DMA */
+
+#if WH_DEV_ID_DMA <= 0
+#error "WH_DEV_ID_DMA must be a positive, nonzero value"
+#endif
+#if WH_DEV_ID == WH_DEV_ID_DMA
+#error "WH_DEV_ID and WH_DEV_ID_DMA must be distinct"
+#endif
+
+#endif /* WOLFHSM_CFG_DMA */
+
+#else /* WOLFHSM_CFG_NO_CRYPTO */
+
 /*  for compile purpose */
 #define WH_DEV_ID -2 /* invalid ID */
 /* cipher types */
 enum wc_CipherType {
     WC_CIPHER_NONE = 0,
 };
-#endif
+
+#endif /* !WOLFHSM_CFG_NO_CRYPTO*/
+
+/* Get the devId for a client context (c is a whClientContext*). This is the
+ * devId set at wh_Client_Init(): whClientConfig.devId, or WH_DEV_ID if that
+ * was 0. Only valid after a successful init. */
+#define WH_CLIENT_DEVID(c) ((c)->devId)
 
 /** Client DMA address translation and validation */
 #ifdef WOLFHSM_CFG_DMA
@@ -96,6 +132,8 @@ typedef int (*whClientDmaClientMemCb)(struct whClientContext_t* client,
 typedef struct {
     whClientDmaClientMemCb    cb;
     const whDmaAddrAllowList* dmaAddrAllowList; /* allowed addresses */
+    /* nonzero to prefer the DMA path */
+    uint32_t preferDma;
 } whClientDmaConfig;
 
 /* Per-operation async DMA context: stores translated input DMA address
@@ -147,14 +185,35 @@ typedef struct {
     uint64_t  inSz;
 } whClientDmaAsyncCmac;
 
-/* Async DMA context union. Only one DMA request can be in flight at a time
- * per client context, so a single union suffices. Each Response function
- * knows which member to access based on its own operation type. */
+/* One client buffer mapped across a DMA Request/Response boundary. The Request
+ * stashes the translated address, original client address, length, and POST
+ * direction; the Response runs wh_Client_DmaAsyncPost(). sz == 0 means nothing
+ * to clean up. postOper keeps the POST direction-correct when this shared union
+ * member is used by different ops; it does not make a mispaired Request/Response
+ * safe (the one-in-flight, self-paired invariant still applies). */
+typedef struct {
+    uintptr_t xformedAddr;
+    uintptr_t clientAddr;
+    uint64_t  sz;
+    whDmaOper postOper;
+} whClientDmaAsyncBuf;
+
+/* Two buffers mapped together for NvmAddObjectDma (metadata + optional data). */
+typedef struct {
+    whClientDmaAsyncBuf meta;
+    whClientDmaAsyncBuf data;
+} whClientDmaAsyncNvmAdd;
+
+/* Async DMA context union; only one DMA request is in flight at a time. The
+ * crypto members (sha/rng/cmac/aes) are bespoke and predate the generic holder.
+ * Key/NVM ops use `buf` (single-buffer) and `nvmAdd` (two-buffer). */
 typedef union {
-    whClientDmaAsyncSha  sha;
-    whClientDmaAsyncRng  rng;
-    whClientDmaAsyncAes  aes;
-    whClientDmaAsyncCmac cmac;
+    whClientDmaAsyncSha    sha;
+    whClientDmaAsyncRng    rng;
+    whClientDmaAsyncAes    aes;
+    whClientDmaAsyncCmac   cmac;
+    whClientDmaAsyncBuf    buf;
+    whClientDmaAsyncNvmAdd nvmAdd;
 } whClientDmaAsyncCtx;
 
 typedef struct {
@@ -162,6 +221,8 @@ typedef struct {
     const whDmaAddrAllowList* dmaAddrAllowList; /* allowed addresses */
     void* heap; /* heap hint for using static memory (or other allocator) */
     whClientDmaAsyncCtx asyncCtx;
+    /* nonzero to prefer the DMA path */
+    uint32_t preferDma;
 } whClientDmaContext;
 #endif /* WOLFHSM_CFG_DMA */
 
@@ -170,6 +231,13 @@ struct whClientContext_t {
     uint16_t     last_req_id;
     uint16_t     last_req_kind;
     uint32_t     cryptoAffinity;
+    /* devId registered at init (see WH_CLIENT_DEVID). Nonzero only after a
+     * successful init. */
+    int devId;
+    /* Nonzero once this context has called wolfCrypt_Init(), so
+     * wh_Client_Cleanup() calls wolfCrypt_Cleanup() once to match and not when
+     * init failed before wolfCrypt_Init() ran (e.g. comm init failed). */
+    int cryptoInitialized;
 #ifdef WOLFHSM_CFG_DMA
     whClientDmaContext dma;
 #endif /* WOLFHSM_CFG_DMA */
@@ -178,6 +246,10 @@ struct whClientContext_t {
 
 struct whClientConfig_t {
     whCommClientConfig* comm;
+    /* devId to register for this client. 0 picks the default WH_DEV_ID.
+     * Otherwise it must be positive, and (with WOLFHSM_CFG_DMA) not
+     * WH_DEV_ID_DMA, which is reserved. Ignored when WOLFHSM_CFG_NO_CRYPTO. */
+    int devId;
 #ifdef WOLFHSM_CFG_DMA
     whClientDmaConfig* dmaConfig;
 #endif /* WOLFHSM_CFG_DMA */
@@ -232,13 +304,16 @@ int wh_Client_SendRequest(whClientContext* c, uint16_t group, uint16_t action,
  * @param c The client context.
  * @param out_group Pointer to store the received group value.
  * @param out_action Pointer to store the received action value.
- * @param out_size Pointer to store the received size value.
+ * @param out_size Pointer to store the received size value. On
+ * WH_ERROR_BUFFER_SIZE this is set to the required size.
+ * @param data_size Capacity in bytes of the caller-supplied data buffer.
+ * Returns WH_ERROR_BUFFER_SIZE if the response payload exceeds it.
  * @param data Pointer to store the received data.
  * @return 0 if successful, a negative value if an error occurred.
  */
 int wh_Client_RecvResponse(whClientContext* c, uint16_t* out_group,
                            uint16_t* out_action, uint16_t* out_size,
-                           void* data);
+                           uint16_t data_size, void* data);
 
 /**
  * @brief Reports whether a request has been sent whose matching response has
@@ -417,6 +492,8 @@ int wh_Client_CommInfo(whClientContext* c,
  * Affinity is stored locally and transmitted per-message in every crypto
  * request. No round-trip to the server is required.
  *
+ * Requires WOLFHSM_CFG_CRYPTO_AFFINITY.
+ *
  * @param[in] c Pointer to the client context.
  * @param[in] affinity Requested crypto affinity (WH_CRYPTO_AFFINITY_SW or
  *                     WH_CRYPTO_AFFINITY_HW).
@@ -427,11 +504,40 @@ int wh_Client_SetCryptoAffinity(whClientContext* c, uint32_t affinity);
 /**
  * @brief Gets the current crypto affinity from the client context.
  *
+ * Requires WOLFHSM_CFG_CRYPTO_AFFINITY.
+ *
  * @param[in] c Pointer to the client context.
  * @param[out] out_affinity Pointer to store the current crypto affinity.
  * @return int Returns 0 on success, or WH_ERROR_BADARGS on invalid input.
  */
 int wh_Client_GetCryptoAffinity(whClientContext* c, uint32_t* out_affinity);
+
+/**
+ * @brief Turns the DMA path on or off for this client.
+ *
+ * When on, operations that support DMA use it and the rest fall back to the
+ * normal path. You can change this at any time; it is stored locally and does
+ * not contact the server.
+ *
+ * Always available: without WOLFHSM_CFG_DMA it does nothing and returns
+ * success, so you need not guard the call with #ifdef.
+ *
+ * @param[in] c Pointer to the client context.
+ * @param[in] useDma Nonzero to use DMA where supported, zero for the normal
+ *                   path.
+ * @return int 0 on success, or WH_ERROR_BADARGS on invalid input.
+ */
+int wh_Client_SetDmaMode(whClientContext* c, int useDma);
+
+/**
+ * @brief Gets the current DMA mode for this client.
+ *
+ * @param[in] c Pointer to the client context.
+ * @param[out] out_useDma Set to the current mode (0 or 1; always 0 without
+ *                        WOLFHSM_CFG_DMA).
+ * @return int 0 on success, or WH_ERROR_BADARGS on invalid input.
+ */
+int wh_Client_GetDmaMode(whClientContext* c, int* out_useDma);
 
 /**
  * @brief Sends a communication close request to the server.
@@ -606,6 +712,61 @@ int wh_Client_KeyCacheResponse(whClientContext* c, uint16_t* keyId);
 int wh_Client_KeyCache(whClientContext* c, uint32_t flags, uint8_t* label,
                        uint16_t labelSz, const uint8_t* in, uint16_t inSz,
                        uint16_t* keyId);
+
+/**
+ * @brief Sends a request to generate a key from the server RNG and cache it.
+ *
+ * The server generates keySz random bytes into a cache slot and returns only
+ * the assigned key ID. This function does not block; it returns immediately
+ * after sending the request.
+ *
+ * @param[in] c Pointer to the client context.
+ * @param[in] flags Flags (whNvmFlags) for the generated key.
+ * @param[in] label Pointer to the label associated with the key.
+ * @param[in] labelSz Size of the label.
+ * @param[in] keySz Number of random key bytes to generate.
+ * @param[in] keyId Key ID to be used. If set to WH_KEYID_ERASED, a new ID
+ * will be generated.
+ * @return int Returns 0 on success, or a negative error code on failure.
+ */
+int wh_Client_KeyCacheRandomRequest(whClientContext* c, uint32_t flags,
+                                    uint8_t* label, uint16_t labelSz,
+                                    uint16_t keySz, uint16_t keyId);
+
+/**
+ * @brief Receives the response to a generate-and-cache request.
+ *
+ * This function attempts to process the response to a request that had the
+ * server generate a key from its RNG and cache it. It validates the response
+ * and extracts the key ID of the cached key. This function does not block; it
+ * returns WH_ERROR_NOTREADY if a response has not been received.
+ *
+ * @param[in] c Pointer to the client context.
+ * @param[out] outKeyId Pointer to store the key ID assigned by the server.
+ * @return int Returns 0 on success, WH_ERROR_NOTREADY if no response is
+ * available, or a negative error code on failure.
+ */
+int wh_Client_KeyCacheRandomResponse(whClientContext* c, uint16_t* outKeyId);
+
+/**
+ * @brief Generates a key from the server RNG, caches it, and returns its ID.
+ *
+ * This function handles the complete process of requesting the server to
+ * generate a key from its RNG and receiving the response. It blocks until the
+ * operation completes or an error occurs.
+ *
+ * @param[in] c Pointer to the client context.
+ * @param[in] flags Flags (whNvmFlags) for the generated key.
+ * @param[in] label Pointer to the label associated with the key.
+ * @param[in] labelSz Size of the label.
+ * @param[in] keySz Number of random key bytes to generate.
+ * @param[in,out] inOutKeyId On input, the requested key ID (or
+ * WH_KEYID_ERASED). On success, stores the key ID assigned by the server.
+ * @return int Returns 0 on success, or a negative error code on failure.
+ */
+int wh_Client_KeyCacheRandom(whClientContext* c, uint32_t flags,
+                                 uint8_t* label, uint16_t labelSz,
+                                 uint16_t keySz, uint16_t* inOutKeyId);
 
 /**
  * @brief Sends a key eviction request to the server.
@@ -1102,6 +1263,64 @@ int wh_Client_KeyWrapResponse(whClientContext*   ctx,
                               void* wrappedKeyOut, uint16_t* wrappedKeyInOutSz);
 
 /**
+ * @brief Wraps a key the server already holds (by id) and exports the blob.
+ *
+ * Unlike wh_Client_KeyWrap, the client never presents plaintext key material:
+ * it names an existing keystore key by id (and type) and the server reads it,
+ * enforces export permissions (NONEXPORTABLE), wraps it with the KEK, and
+ * returns the wrapped blob. SHE keys are wrapped as TYPE=SHE; other keys are
+ * normalized to the wrapped-key namespace so the blob round-trips through
+ * wh_Client_KeyUnwrapAndCache. Blocks until the operation completes.
+ *
+ * @param[in] ctx Pointer to the client context.
+ * @param[in] cipherType Cipher used to wrap the key.
+ * @param[in] keyId Client-facing id (with optional GLOBAL/WRAPPED flags) of the
+ *                  keystore key to wrap.
+ * @param[in] keyType WH_KEYTYPE_* of the target key (e.g. WH_KEYTYPE_CRYPTO or
+ *                    WH_KEYTYPE_SHE).
+ * @param[in] serverKeyId Key ID of the key encryption key on the server.
+ * @param[out] wrappedKeyOut Pointer to store the wrapped key.
+ * @param[in,out] wrappedKeyInOutSz IN: size of wrappedKeyOut; OUT: size of the
+ *                    wrapped key object returned by the server.
+ * @return int Returns 0 on success, or a negative error code on failure.
+ */
+int wh_Client_KeyWrapExport(whClientContext* ctx, enum wc_CipherType cipherType,
+                            uint16_t keyId, uint16_t keyType,
+                            uint16_t serverKeyId, void* wrappedKeyOut,
+                            uint16_t* wrappedKeyInOutSz);
+
+/**
+ * @brief Sends a wrap-and-export (by id) request to the server. Non-blocking.
+ *
+ * @param[in] ctx Pointer to the client context.
+ * @param[in] cipherType Cipher used to wrap the key.
+ * @param[in] keyId Client-facing id of the keystore key to wrap.
+ * @param[in] keyType WH_KEYTYPE_* of the target key.
+ * @param[in] serverKeyId Key ID of the key encryption key on the server.
+ * @return int Returns 0 on success, or a negative error code on failure.
+ */
+int wh_Client_KeyWrapExportRequest(whClientContext*   ctx,
+                                   enum wc_CipherType cipherType,
+                                   uint16_t keyId, uint16_t keyType,
+                                   uint16_t serverKeyId);
+
+/**
+ * @brief Receives a wrap-and-export response from the server. Returns
+ * WH_ERROR_NOTREADY if a response has not been received.
+ *
+ * @param[in] ctx Pointer to the client context.
+ * @param[in] cipherType Cipher used to wrap the key.
+ * @param[out] wrappedKeyOut Pointer to store the wrapped key.
+ * @param[in,out] wrappedKeyInOutSz IN: size of wrappedKeyOut; OUT: size of the
+ *                    wrapped key object.
+ * @return int Returns 0 on success, or a negative error code on failure.
+ */
+int wh_Client_KeyWrapExportResponse(whClientContext*   ctx,
+                                    enum wc_CipherType cipherType,
+                                    void*              wrappedKeyOut,
+                                    uint16_t*          wrappedKeyInOutSz);
+
+/**
  * @brief Requests the server to unwrap and export a wrapped key and receives
  * the response
  *
@@ -1257,6 +1476,47 @@ int wh_Client_DataWrap(whClientContext* ctx, enum wc_CipherType cipherType,
                        void* wrappedDataOut, uint32_t* wrappedDataInOutSz);
 
 /**
+ * @brief Sends a data wrap request to the server
+ *
+ * This function prepares and sends a data wrap request to the server. The
+ * request data contains the plaintext data for the server to wrap. This
+ * function does not block; it returns immediately after sending the request.
+ *
+ * @param[in] ctx Pointer to the client context.
+ * @param[in] cipherType Cipher used when wrapping the data.
+ * @param[in] serverKeyId Key ID to be used for wrapping the data.
+ * @param[in] dataIn Pointer to the plaintext data you want to wrap.
+ * @param[in] dataInSz The size in bytes of the plaintext data.
+ * @return int Returns 0 on success, or a negative error code on failure.
+ */
+int wh_Client_DataWrapRequest(whClientContext*   ctx,
+                              enum wc_CipherType cipherType,
+                              uint16_t serverKeyId, void* dataIn,
+                              uint32_t dataInSz);
+
+/**
+ * @brief Receives a data wrap response from the server
+ *
+ * This function attempts to process a data wrap response message from the
+ * server. It will validate the response and extract the wrapped data from
+ * the response data. This function does not block; it returns
+ * WH_ERROR_NOTREADY if a response has not been received.
+ *
+ * @param[in] ctx Pointer to the client context.
+ * @param[in] cipherType Cipher used when wrapping the data.
+ * @param[out] wrappedDataOut The pointer to the buffer that stores the
+ * resulting wrapped data.
+ * @param[in/out] wrappedDataSz IN: The size in bytes of wrappedDataOut
+ * buffer. OUT: The size of the wrapped data object returned from the server.
+ * OUT may be less than IN.
+ * @return int Returns 0 on success, WH_ERROR_NOTREADY if no response is
+ * available, or a negative error code on failure.
+ */
+int wh_Client_DataWrapResponse(whClientContext*   ctx,
+                               enum wc_CipherType cipherType,
+                               void* wrappedDataOut, uint32_t* wrappedDataSz);
+
+/**
  * @brief Helper function to unwrap a wrapped data object using a specified key
  *
  * This helper function uses existing calls in wolfHSM and wolfCrypt to
@@ -1279,6 +1539,48 @@ int wh_Client_DataUnwrap(whClientContext* ctx, enum wc_CipherType cipherType,
                          uint16_t serverKeyId, void* wrappedDataIn,
                          uint32_t wrappedDataInSz, void* dataOut,
                          uint32_t* dataInOutSz);
+
+/**
+ * @brief Sends a data unwrap request to the server
+ *
+ * This function prepares and sends a data unwrap request to the server. The
+ * request data contains the wrapped data object for the server to unwrap.
+ * This function does not block; it returns immediately after sending the
+ * request.
+ *
+ * @param[in] ctx Pointer to the client context.
+ * @param[in] cipherType Cipher used when unwrapping the data.
+ * @param[in] serverKeyId Key ID to be used for unwrapping the data.
+ * @param[in] wrappedDataIn Pointer to the wrapped data object you want to
+ * unwrap.
+ * @param[in] wrappedDataInSz The size in bytes of the wrapped data object.
+ * @return int Returns 0 on success, or a negative error code on failure.
+ */
+int wh_Client_DataUnwrapRequest(whClientContext*   ctx,
+                                enum wc_CipherType cipherType,
+                                uint16_t serverKeyId, void* wrappedDataIn,
+                                uint32_t wrappedDataInSz);
+
+/**
+ * @brief Receives a data unwrap response from the server
+ *
+ * This function attempts to process a data unwrap response message from the
+ * server. It will validate the response and extract the unwrapped data from
+ * the response data. This function does not block; it returns
+ * WH_ERROR_NOTREADY if a response has not been received.
+ *
+ * @param[in] ctx Pointer to the client context.
+ * @param[in] cipherType Cipher used when unwrapping the data.
+ * @param[out] dataOut The pointer to the buffer that stores the resulting
+ * unwrapped data.
+ * @param[in/out] dataSz IN: The size in bytes of dataOut. OUT: The size of
+ * the unwrapped data object returned by the server. OUT may be less than IN.
+ * @return int Returns 0 on success, WH_ERROR_NOTREADY if no response is
+ * available, or a negative error code on failure.
+ */
+int wh_Client_DataUnwrapResponse(whClientContext*   ctx,
+                                 enum wc_CipherType cipherType, void* dataOut,
+                                 uint32_t* dataSz);
 
 /* Counter functions */
 int wh_Client_CounterInitRequest(whClientContext* c, whNvmId counterId,
@@ -2615,8 +2917,13 @@ int wh_Client_CertVerifyRequest(whClientContext* c, const uint8_t* cert,
  * if a response has not been received.
  *
  * @param[in] c Pointer to the client context.
- * @param[out] out_rc Pointer to store the response code from the server.
- * @return int Returns 0 on success, or a negative error code on failure.
+ * @param[out] out_rc Required (non-NULL); receives the verification verdict
+ * (WH_ERROR_OK if the certificate is valid). Passing NULL returns
+ * WH_ERROR_BADARGS.
+ * @return int Returns 0 when the request/response round-trip completes. This
+ * alone does NOT mean the certificate is valid: the caller MUST also check
+ * that *out_rc == WH_ERROR_OK. Returns a negative error code on transport
+ * failure.
  */
 int wh_Client_CertVerifyResponse(whClientContext* c, int32_t* out_rc);
 
@@ -2632,8 +2939,28 @@ int wh_Client_CertVerifyResponse(whClientContext* c, int32_t* out_rc);
  * @param[in] cert_len Length of the certificate data.
  * @param[in] trustedRootNvmId NVM ID of the trusted root certificate to verify
  * against.
- * @param[out] out_rc Pointer to store the response code from the server.
- * @return int Returns 0 on success, or a negative error code on failure.
+ * @param[out] out_rc Required (non-NULL); receives the verification verdict
+ * (WH_ERROR_OK if the certificate is valid). Passing NULL returns
+ * WH_ERROR_BADARGS.
+ * @return int Returns 0 when the request/response round-trip completes. This
+ * alone does NOT mean the certificate is valid: the caller MUST also check
+ * that *out_rc == WH_ERROR_OK. Returns a negative error code on transport
+ * failure.
+ *
+ * Both results must be checked, e.g.:
+ * @code
+ *     int32_t verifyResult = 0;
+ *     int rc = wh_Client_CertVerify(c, cert, cert_len, rootId, &verifyResult);
+ *     if (rc != 0) {
+ *         // transport/protocol failure - verdict unknown
+ *     }
+ *     else if (verifyResult != WH_ERROR_OK) {
+ *         // round-trip ok, but the certificate did NOT verify
+ *     }
+ *     else {
+ *         // certificate is valid
+ *     }
+ * @endcode
  */
 int wh_Client_CertVerify(whClientContext* c, const uint8_t* cert,
                          uint32_t cert_len, whNvmId trustedRootNvmId,
@@ -2673,8 +3000,13 @@ int wh_Client_CertVerifyAndCacheLeafPubKeyRequest(
  * @param[in] c Pointer to the client context.
  * @param[out] out_keyId Pointer to store the key ID of the cached leaf public
  * key.
- * @param[out] out_rc Pointer to store the response code from the server.
- * @return int Returns 0 on success, or a negative error code on failure.
+ * @param[out] out_rc Required (non-NULL); receives the verification verdict
+ * (WH_ERROR_OK if the certificate is valid). Passing NULL returns
+ * WH_ERROR_BADARGS.
+ * @return int Returns 0 when the request/response round-trip completes. This
+ * alone does NOT mean the certificate is valid: the caller MUST also check
+ * that *out_rc == WH_ERROR_OK. Returns a negative error code on transport
+ * failure.
  */
 int wh_Client_CertVerifyAndCacheLeafPubKeyResponse(whClientContext* c,
                                                    whKeyId*         out_keyId,
@@ -2698,8 +3030,13 @@ int wh_Client_CertVerifyAndCacheLeafPubKeyResponse(whClientContext* c,
  * @param[in,out] inout_keyId Pointer to the desired key ID of the cached leaf
  * public key. If set to WH_KEYID_ERASED, the server will pick a keyId. On
  * output, contains the keyId of the cached leaf public key.
- * @param[out] out_rc Pointer to store the response code from the server.
- * @return int Returns 0 on success, or a negative error code on failure.
+ * @param[out] out_rc Required (non-NULL); receives the verification verdict
+ * (WH_ERROR_OK if the certificate is valid). Passing NULL returns
+ * WH_ERROR_BADARGS.
+ * @return int Returns 0 when the request/response round-trip completes. This
+ * alone does NOT mean the certificate is valid: the caller MUST also check
+ * that *out_rc == WH_ERROR_OK. Returns a negative error code on transport
+ * failure.
  */
 int wh_Client_CertVerifyAndCacheLeafPubKey(
     whClientContext* c, const uint8_t* cert, uint32_t cert_len,
@@ -2734,8 +3071,13 @@ int wh_Client_CertVerifyMultiRootRequest(whClientContext* c,
  * verification.
  *
  * @param[in] c Pointer to the client context.
- * @param[out] out_rc Pointer to store the response code from the server.
- * @return int Returns 0 on success, or a negative error code on failure.
+ * @param[out] out_rc Required (non-NULL); receives the verification verdict
+ * (WH_ERROR_OK if the certificate is valid). Passing NULL returns
+ * WH_ERROR_BADARGS.
+ * @return int Returns 0 when the request/response round-trip completes. This
+ * alone does NOT mean the certificate is valid: the caller MUST also check
+ * that *out_rc == WH_ERROR_OK. Returns a negative error code on transport
+ * failure.
  */
 int wh_Client_CertVerifyMultiRootResponse(whClientContext* c, int32_t* out_rc);
 
@@ -2748,8 +3090,13 @@ int wh_Client_CertVerifyMultiRootResponse(whClientContext* c, int32_t* out_rc);
  * @param[in] cert_len Length of the certificate data.
  * @param[in] trustedRootNvmIds Array of NVM IDs of trusted root certificates.
  * @param[in] numRoots Number of entries in trustedRootNvmIds.
- * @param[out] out_rc Pointer to store the response code from the server.
- * @return int Returns 0 on success, or a negative error code on failure.
+ * @param[out] out_rc Required (non-NULL); receives the verification verdict
+ * (WH_ERROR_OK if the certificate is valid). Passing NULL returns
+ * WH_ERROR_BADARGS.
+ * @return int Returns 0 when the request/response round-trip completes. This
+ * alone does NOT mean the certificate is valid: the caller MUST also check
+ * that *out_rc == WH_ERROR_OK. Returns a negative error code on transport
+ * failure.
  */
 int wh_Client_CertVerifyMultiRoot(whClientContext* c, const uint8_t* cert,
                                   uint32_t       cert_len,
@@ -2782,8 +3129,13 @@ int wh_Client_CertVerifyMultiRootAndCacheLeafPubKeyRequest(
  * @param[in] c Pointer to the client context.
  * @param[out] out_keyId Pointer to store the key ID of the cached leaf public
  * key.
- * @param[out] out_rc Pointer to store the response code from the server.
- * @return int Returns 0 on success, or a negative error code on failure.
+ * @param[out] out_rc Required (non-NULL); receives the verification verdict
+ * (WH_ERROR_OK if the certificate is valid). Passing NULL returns
+ * WH_ERROR_BADARGS.
+ * @return int Returns 0 when the request/response round-trip completes. This
+ * alone does NOT mean the certificate is valid: the caller MUST also check
+ * that *out_rc == WH_ERROR_OK. Returns a negative error code on transport
+ * failure.
  */
 int wh_Client_CertVerifyMultiRootAndCacheLeafPubKeyResponse(whClientContext* c,
                                                             whKeyId* out_keyId,
@@ -2802,16 +3154,107 @@ int wh_Client_CertVerifyMultiRootAndCacheLeafPubKeyResponse(whClientContext* c,
  * @param[in] cachedKeyFlags NVM usage flags for the cached leaf public key.
  * @param[in,out] inout_keyId Pointer to the desired key ID (in) / cached key
  * ID (out).
- * @param[out] out_rc Pointer to store the response code from the server.
- * @return int Returns 0 on success, or a negative error code on failure.
+ * @param[out] out_rc Required (non-NULL); receives the verification verdict
+ * (WH_ERROR_OK if the certificate is valid). Passing NULL returns
+ * WH_ERROR_BADARGS.
+ * @return int Returns 0 when the request/response round-trip completes. This
+ * alone does NOT mean the certificate is valid: the caller MUST also check
+ * that *out_rc == WH_ERROR_OK. Returns a negative error code on transport
+ * failure.
  */
 int wh_Client_CertVerifyMultiRootAndCacheLeafPubKey(
     whClientContext* c, const uint8_t* cert, uint32_t cert_len,
     const whNvmId* trustedRootNvmIds, uint16_t numRoots,
     whNvmFlags cachedKeyFlags, whKeyId* inout_keyId, int32_t* out_rc);
 
+#ifdef WOLFHSM_CFG_CERTIFICATE_VERIFY_CACHE
+/**
+ * @brief Send a request to clear the server's trusted certificate verify cache.
+ *
+ * Subsequent verification of any certificate will re-run the public-key
+ * signature check until that cert is verified again and re-cached.
+ *
+ * @param[in] c Pointer to the client context.
+ * @return int Returns 0 on success, or a negative error code on failure.
+ */
+int wh_Client_CertVerifyCacheClearRequest(whClientContext* c);
+
+/**
+ * @brief Receive the response to a verify-cache clear request.
+ *
+ * @param[in]  c      Pointer to the client context.
+ * @param[out] out_rc Pointer to store the response code from the server.
+ * @return int Returns 0 on success, or a negative error code on failure.
+ */
+int wh_Client_CertVerifyCacheClearResponse(whClientContext* c, int32_t* out_rc);
+
+/**
+ * @brief Synchronous helper to clear the server's trusted certificate verify
+ * cache.
+ *
+ * @param[in]  c      Pointer to the client context.
+ * @param[out] out_rc Pointer to store the response code from the server.
+ * @return int Returns 0 on success, or a negative error code on failure.
+ */
+int wh_Client_CertVerifyCacheClear(whClientContext* c, int32_t* out_rc);
+
+/**
+ * @brief Send a request to enable or disable the server's trusted certificate
+ * verify cache at runtime.
+ *
+ * Disabling clears all existing cache entries and suppresses both subsequent
+ * lookups and inserts until the cache is re-enabled. Enabling resumes normal
+ * caching from an empty state. The cache defaults to enabled at server init
+ * so this call is only needed to opt out (or re-enable after opting out).
+ *
+ * In per-client cache mode the toggle is scoped to this client's server. With
+ * WOLFHSM_CFG_CERTIFICATE_VERIFY_CACHE_GLOBAL the toggle is shared across all
+ * clients connected to the same NVM context.
+ *
+ * @param[in] c      Pointer to the client context.
+ * @param[in] enable Non-zero to enable caching, zero to disable.
+ * @return int Returns 0 on success, or a negative error code on failure.
+ */
+int wh_Client_CertVerifyCacheSetEnabledRequest(whClientContext* c,
+                                               uint8_t          enable);
+
+/**
+ * @brief Receive the response to a verify-cache enable/disable request.
+ *
+ * @param[in]  c      Pointer to the client context.
+ * @param[out] out_rc Pointer to store the response code from the server.
+ * @return int Returns 0 on success, or a negative error code on failure.
+ */
+int wh_Client_CertVerifyCacheSetEnabledResponse(whClientContext* c,
+                                                int32_t*         out_rc);
+
+/**
+ * @brief Synchronous helper to enable or disable the server's trusted
+ * certificate verify cache.
+ *
+ * @param[in]  c      Pointer to the client context.
+ * @param[in]  enable Non-zero to enable caching, zero to disable.
+ * @param[out] out_rc Pointer to store the response code from the server.
+ * @return int Returns 0 on success, or a negative error code on failure.
+ */
+int wh_Client_CertVerifyCacheSetEnabled(whClientContext* c, uint8_t enable,
+                                        int32_t* out_rc);
+#endif /* WOLFHSM_CFG_CERTIFICATE_VERIFY_CACHE */
+
 
 #ifdef WOLFHSM_CFG_DMA
+
+/*
+ * Certificate DMA API notes (apply to every wh_Client_Cert*Dma* below):
+ *
+ * - Each *DmaRequest translates the cert buffer and the matching *DmaResponse
+ *   releases it, using the single shared per-client DMA slot (see
+ *   whClientDmaAsyncCtx): only ONE *Dma operation (cert/key/NVM) may be in
+ *   flight at a time. Pair the split Request/Response one-at-a-time; issuing a
+ *   second Request first overwrites the slot and leaks the earlier mapping.
+ * - A *DmaRequest (hence a blocking *Dma call) may return
+ *   WH_ERROR_REQUEST_PENDING if a prior request has not been consumed.
+ */
 
 /**
  * @brief Sends a request to add a trusted certificate to NVM storage using DMA.
@@ -2943,8 +3386,13 @@ int wh_Client_CertVerifyDmaRequest(whClientContext* c, const void* cert,
  * response has not been received.
  *
  * @param[in] c Pointer to the client context.
- * @param[out] out_rc Pointer to store the response code from the server.
- * @return int Returns 0 on success, or a negative error code on failure.
+ * @param[out] out_rc Required (non-NULL); receives the verification verdict
+ * (WH_ERROR_OK if the certificate is valid). Passing NULL returns
+ * WH_ERROR_BADARGS.
+ * @return int Returns 0 when the request/response round-trip completes. This
+ * alone does NOT mean the certificate is valid: the caller MUST also check
+ * that *out_rc == WH_ERROR_OK. Returns a negative error code on transport
+ * failure.
  */
 int wh_Client_CertVerifyDmaResponse(whClientContext* c, int32_t* out_rc);
 
@@ -2961,8 +3409,13 @@ int wh_Client_CertVerifyDmaResponse(whClientContext* c, int32_t* out_rc);
  * @param[in] cert_len Length of the certificate data.
  * @param[in] trustedRootNvmId NVM ID of the trusted root certificate to verify
  * against.
- * @param[out] out_rc Pointer to store the response code from the server.
- * @return int Returns 0 on success, or a negative error code on failure.
+ * @param[out] out_rc Required (non-NULL); receives the verification verdict
+ * (WH_ERROR_OK if the certificate is valid). Passing NULL returns
+ * WH_ERROR_BADARGS.
+ * @return int Returns 0 when the request/response round-trip completes. This
+ * alone does NOT mean the certificate is valid: the caller MUST also check
+ * that *out_rc == WH_ERROR_OK. Returns a negative error code on transport
+ * failure.
  */
 int wh_Client_CertVerifyDma(whClientContext* c, const void* cert,
                             uint32_t cert_len, whNvmId trustedRootNvmId,
@@ -3006,8 +3459,13 @@ int wh_Client_CertVerifyDmaAndCacheLeafPubKeyRequest(
  * @param[in] c Pointer to the client context.
  * @param[out] out_keyId Pointer to store the key ID of the cached leaf public
  * key.
- * @param[out] out_rc Pointer to store the response code from the server.
- * @return int Returns 0 on success, or a negative error code on failure.
+ * @param[out] out_rc Required (non-NULL); receives the verification verdict
+ * (WH_ERROR_OK if the certificate is valid). Passing NULL returns
+ * WH_ERROR_BADARGS.
+ * @return int Returns 0 when the request/response round-trip completes. This
+ * alone does NOT mean the certificate is valid: the caller MUST also check
+ * that *out_rc == WH_ERROR_OK. Returns a negative error code on transport
+ * failure.
  */
 int wh_Client_CertVerifyDmaAndCacheLeafPubKeyResponse(whClientContext* c,
                                                       whKeyId* out_keyId,
@@ -3032,8 +3490,13 @@ int wh_Client_CertVerifyDmaAndCacheLeafPubKeyResponse(whClientContext* c,
  * @param[in,out] inout_keyId Pointer to the desired key ID of the cached leaf
  * public key. If set to WH_KEYID_ERASED, the server will pick a keyId. On
  * output, contains the keyId of the cached leaf public key.
- * @param[out] out_rc Pointer to store the response code from the server.
- * @return int Returns 0 on success, or a negative error code on failure.
+ * @param[out] out_rc Required (non-NULL); receives the verification verdict
+ * (WH_ERROR_OK if the certificate is valid). Passing NULL returns
+ * WH_ERROR_BADARGS.
+ * @return int Returns 0 when the request/response round-trip completes. This
+ * alone does NOT mean the certificate is valid: the caller MUST also check
+ * that *out_rc == WH_ERROR_OK. Returns a negative error code on transport
+ * failure.
  */
 int wh_Client_CertVerifyDmaAndCacheLeafPubKey(
     whClientContext* c, const void* cert, uint32_t cert_len,
@@ -3068,8 +3531,13 @@ int wh_Client_CertVerifyMultiRootDmaRequest(whClientContext* c,
  * certificate verification.
  *
  * @param[in] c Pointer to the client context.
- * @param[out] out_rc Pointer to store the response code from the server.
- * @return int Returns 0 on success, or a negative error code on failure.
+ * @param[out] out_rc Required (non-NULL); receives the verification verdict
+ * (WH_ERROR_OK if the certificate is valid). Passing NULL returns
+ * WH_ERROR_BADARGS.
+ * @return int Returns 0 when the request/response round-trip completes. This
+ * alone does NOT mean the certificate is valid: the caller MUST also check
+ * that *out_rc == WH_ERROR_OK. Returns a negative error code on transport
+ * failure.
  */
 int wh_Client_CertVerifyMultiRootDmaResponse(whClientContext* c,
                                              int32_t*         out_rc);
@@ -3083,8 +3551,13 @@ int wh_Client_CertVerifyMultiRootDmaResponse(whClientContext* c,
  * @param[in] cert_len Length of the certificate data.
  * @param[in] trustedRootNvmIds Array of NVM IDs of trusted root certificates.
  * @param[in] numRoots Number of entries in trustedRootNvmIds.
- * @param[out] out_rc Pointer to store the response code from the server.
- * @return int Returns 0 on success, or a negative error code on failure.
+ * @param[out] out_rc Required (non-NULL); receives the verification verdict
+ * (WH_ERROR_OK if the certificate is valid). Passing NULL returns
+ * WH_ERROR_BADARGS.
+ * @return int Returns 0 when the request/response round-trip completes. This
+ * alone does NOT mean the certificate is valid: the caller MUST also check
+ * that *out_rc == WH_ERROR_OK. Returns a negative error code on transport
+ * failure.
  */
 int wh_Client_CertVerifyMultiRootDma(whClientContext* c, const void* cert,
                                      uint32_t       cert_len,
@@ -3117,8 +3590,13 @@ int wh_Client_CertVerifyMultiRootDmaAndCacheLeafPubKeyRequest(
  * @param[in] c Pointer to the client context.
  * @param[out] out_keyId Pointer to store the key ID of the cached leaf public
  * key.
- * @param[out] out_rc Pointer to store the response code from the server.
- * @return int Returns 0 on success, or a negative error code on failure.
+ * @param[out] out_rc Required (non-NULL); receives the verification verdict
+ * (WH_ERROR_OK if the certificate is valid). Passing NULL returns
+ * WH_ERROR_BADARGS.
+ * @return int Returns 0 when the request/response round-trip completes. This
+ * alone does NOT mean the certificate is valid: the caller MUST also check
+ * that *out_rc == WH_ERROR_OK. Returns a negative error code on transport
+ * failure.
  */
 int wh_Client_CertVerifyMultiRootDmaAndCacheLeafPubKeyResponse(
     whClientContext* c, whKeyId* out_keyId, int32_t* out_rc);
@@ -3136,8 +3614,13 @@ int wh_Client_CertVerifyMultiRootDmaAndCacheLeafPubKeyResponse(
  * @param[in] cachedKeyFlags NVM usage flags for the cached leaf public key.
  * @param[in,out] inout_keyId Pointer to the desired key ID (in) / cached key
  * ID (out).
- * @param[out] out_rc Pointer to store the response code from the server.
- * @return int Returns 0 on success, or a negative error code on failure.
+ * @param[out] out_rc Required (non-NULL); receives the verification verdict
+ * (WH_ERROR_OK if the certificate is valid). Passing NULL returns
+ * WH_ERROR_BADARGS.
+ * @return int Returns 0 when the request/response round-trip completes. This
+ * alone does NOT mean the certificate is valid: the caller MUST also check
+ * that *out_rc == WH_ERROR_OK. Returns a negative error code on transport
+ * failure.
  */
 int wh_Client_CertVerifyMultiRootDmaAndCacheLeafPubKey(
     whClientContext* c, const void* cert, uint32_t cert_len,
@@ -3175,8 +3658,13 @@ int wh_Client_CertVerifyAcertRequest(whClientContext* c, const void* cert,
  * if a response has not been received.
  *
  * @param[in] c Pointer to the client context.
- * @param[out] out_rc Pointer to store the response code from the server.
- * @return int Returns 0 on success, or a negative error code on failure.
+ * @param[out] out_rc Required (non-NULL); receives the verification verdict
+ * (WH_ERROR_OK if the certificate is valid). Passing NULL returns
+ * WH_ERROR_BADARGS.
+ * @return int Returns 0 when the request/response round-trip completes. This
+ * alone does NOT mean the certificate is valid: the caller MUST also check
+ * that *out_rc == WH_ERROR_OK. Returns a negative error code on transport
+ * failure.
  */
 int wh_Client_CertVerifyAcertResponse(whClientContext* c, int32_t* out_rc);
 
@@ -3193,8 +3681,13 @@ int wh_Client_CertVerifyAcertResponse(whClientContext* c, int32_t* out_rc);
  * @param[in] cert_len Length of the attribute certificate data.
  * @param[in] trustedRootNvmId NVM ID of the trusted root certificate to verify
  * against.
- * @param[out] out_rc Pointer to store the response code from the server.
- * @return int Returns 0 on success, or a negative error code on failure.
+ * @param[out] out_rc Required (non-NULL); receives the verification verdict
+ * (WH_ERROR_OK if the certificate is valid). Passing NULL returns
+ * WH_ERROR_BADARGS.
+ * @return int Returns 0 when the request/response round-trip completes. This
+ * alone does NOT mean the certificate is valid: the caller MUST also check
+ * that *out_rc == WH_ERROR_OK. Returns a negative error code on transport
+ * failure.
  */
 int wh_Client_CertVerifyAcert(whClientContext* c, const void* cert,
                               uint32_t cert_len, whNvmId trustedRootNvmId,
@@ -3228,8 +3721,13 @@ int wh_Client_CertVerifyAcertDmaRequest(whClientContext* c, const void* cert,
  * WH_ERROR_NOTREADY if a response has not been received.
  *
  * @param[in] c Pointer to the client context.
- * @param[out] out_rc Pointer to store the response code from the server.
- * @return int Returns 0 on success, or a negative error code on failure.
+ * @param[out] out_rc Required (non-NULL); receives the verification verdict
+ * (WH_ERROR_OK if the certificate is valid). Passing NULL returns
+ * WH_ERROR_BADARGS.
+ * @return int Returns 0 when the request/response round-trip completes. This
+ * alone does NOT mean the certificate is valid: the caller MUST also check
+ * that *out_rc == WH_ERROR_OK. Returns a negative error code on transport
+ * failure.
  */
 int wh_Client_CertVerifyAcertDmaResponse(whClientContext* c, int32_t* out_rc);
 
@@ -3289,6 +3787,52 @@ int wh_Client_DmaProcessClientAddress(struct whClientContext_t* client,
 
 
 /**
+ * @brief Runs the PRE half of a DMA buffer mapping and stashes it (INTERNAL).
+ *
+ * Shared between the client *Dma source files; not port-facing. Clears the
+ * slot, translates clientAddr for preOper, and on success stashes the mapping
+ * (translated address, client address, length, and the matching POST operation)
+ * so the matching Response can run wh_Client_DmaAsyncPost(). The POST direction
+ * is derived from preOper (READ_PRE -> READ_POST, WRITE_PRE -> WRITE_POST), so
+ * the caller cannot pair them inconsistently. The translated address is returned
+ * in outXformedAddr for the caller to place in the request message. When len is
+ * 0 (e.g. an optional buffer that is absent) it is a no-op: the slot stays
+ * cleared and outXformedAddr is set to 0.
+ *
+ * @param[in] client Pointer to the client context.
+ * @param[in,out] buf The slot to clear and populate with the mapping.
+ * @param[in] clientAddr Original client address to translate.
+ * @param[in] len Length of the buffer (0 to skip / clear only).
+ * @param[in] preOper Client PRE operation (READ_PRE or WRITE_PRE).
+ * @param[out] outXformedAddr Receives the translated address (0 when skipped).
+ * @return WH_ERROR_OK on success or skip, WH_ERROR_BADARGS on NULL args or a
+ *         non-PRE operation, or the port PRE callback's error.
+ */
+int wh_Client_DmaAsyncPre(struct whClientContext_t* client,
+                          whClientDmaAsyncBuf* buf, uintptr_t clientAddr,
+                          uint64_t len, whDmaOper preOper,
+                          uintptr_t* outXformedAddr);
+
+/**
+ * @brief Runs the POST half of a stashed DMA buffer mapping (INTERNAL).
+ *
+ * Shared between the client *Dma source files; not port-facing. Releases (and,
+ * for a server-write buffer, copies back) a mapping stashed by the matching
+ * Request, using buf->postOper for the direction. A no-op (WH_ERROR_OK) when
+ * buf->sz is 0; clears the whole slot (even on failure) so a later Response
+ * cannot re-run it.
+ *
+ * @param[in] client Pointer to the client context.
+ * @param[in,out] buf The stashed single-buffer mapping to clean up.
+ * @return WH_ERROR_OK on success or when there is nothing to clean up
+ *         (buf->sz == 0), WH_ERROR_BADARGS on NULL client/buf, or the port POST
+ *         callback's error (e.g. a failed unmap or copy-back).
+ */
+int wh_Client_DmaAsyncPost(struct whClientContext_t* client,
+                           whClientDmaAsyncBuf*       buf);
+
+
+/**
  * @brief Sends a DMA request and receives a response to verify an attribute
  * certificate.
  *
@@ -3301,8 +3845,13 @@ int wh_Client_DmaProcessClientAddress(struct whClientContext_t* client,
  * @param[in] cert_len Length of the attribute certificate data.
  * @param[in] trustedRootNvmId NVM ID of the trusted root certificate to verify
  * against.
- * @param[out] out_rc Pointer to store the response code from the server.
- * @return int Returns 0 on success, or a negative error code on failure.
+ * @param[out] out_rc Required (non-NULL); receives the verification verdict
+ * (WH_ERROR_OK if the certificate is valid). Passing NULL returns
+ * WH_ERROR_BADARGS.
+ * @return int Returns 0 when the request/response round-trip completes. This
+ * alone does NOT mean the certificate is valid: the caller MUST also check
+ * that *out_rc == WH_ERROR_OK. Returns a negative error code on transport
+ * failure.
  */
 int wh_Client_CertVerifyAcertDma(whClientContext* c, const void* cert,
                                  uint32_t cert_len, whNvmId trustedRootNvmId,
@@ -3358,6 +3907,35 @@ int wh_Client_CertVerifyAcertDma(whClientContext* c, const void* cert,
  */
 #define WH_CLIENT_KEYID_MAKE_WRAPPED_GLOBAL(_id) \
     ((_id) | WH_KEYID_CLIENT_GLOBAL_FLAG | WH_KEYID_CLIENT_WRAPPED_FLAG)
+
+/**
+ * @brief Mark a key ID as hardware-only
+ *
+ * Sets the hardware-only flag in a client keyId to indicate to the server
+ * that this key's material lives exclusively in a hardware keystore. The
+ * server will translate this to KEYTYPE=WH_KEYTYPE_HW and fetch the
+ * material from its hardware keystore backend on demand.
+ *
+ * Hardware-only keys never enter the server key cache or NVM and are never
+ * returned to a client. They are only usable as KEKs in the keywrap API
+ * (key/data wrap and unwrap); all other keystore and crypto operations
+ * reject them with WH_ERROR_ACCESS.
+ *
+ * @note Requires the server to be built with WOLFHSM_CFG_HWKEYSTORE. On a
+ *       server without hardware keystore support the hardware-only flag is
+ *       ignored and the request is treated as an ordinary key ID (looked up
+ *       in the normal cache/NVM keystore), which typically fails with a
+ *       key-not-found error.
+ *
+ * @param _id The key ID (0-255), as understood by the server's hardware
+ *            keystore backend
+ * @return keyId with hardware-only flag set
+ *
+ * Example:
+ *   whKeyId hwKek = WH_CLIENT_KEYID_MAKE_HW(2);
+ *   wh_Client_KeyWrap(client, WC_CIPHER_AES_GCM, hwKek, ...);
+ */
+#define WH_CLIENT_KEYID_MAKE_HW(_id) ((_id) | WH_KEYID_CLIENT_HW_FLAG)
 
 /**
  * @brief Construct wrapped key metadata ID with explicit ownership

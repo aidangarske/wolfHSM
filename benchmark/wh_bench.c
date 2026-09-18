@@ -28,6 +28,7 @@
 #include "wolfhsm/wh_settings.h"
 
 #include "wolfhsm/wh_error.h"
+#include "wolfhsm/wh_utils.h"
 #include "wolfhsm/wh_comm.h"
 #include "wolfhsm/wh_transport_mem.h"
 #include "wolfhsm/wh_nvm.h"
@@ -37,7 +38,6 @@
 #include "wolfhsm/wh_message.h"
 #include "wolfhsm/wh_message_comm.h"
 #include "wolfhsm/wh_client.h"
-#include "wolfhsm/wh_utils.h"
 
 #if defined(WOLFHSM_CFG_TEST_POSIX)
 /* Include transport-specific headers */
@@ -60,6 +60,11 @@
 #define BUFFER_SIZE \
     (sizeof(whTransportMemCsr) + sizeof(whCommHeader) + \
      WOLFHSM_CFG_COMM_DATA_LEN)
+/* req_size/resp_size on whTransportMemConfig and posixTransportShmConfig are
+ * both uint16_t, so BUFFER_SIZE must fit or transport buffers configured from
+ * it will silently truncate. */
+WH_UTILS_STATIC_ASSERT(BUFFER_SIZE <= UINT16_MAX,
+                       "BUFFER_SIZE exceeds uint16_t transport size fields");
 #define FLASH_RAM_SIZE (1024 * 1024) /* 1MB */
 
 typedef struct BenchModule {
@@ -159,8 +164,22 @@ typedef enum BenchModuleIdx {
 
 /* SHA3 */
 #if defined(WOLFSSL_SHA3)
+#if !defined(WOLFSSL_NOSHA3_224)
+    BENCH_MODULE_IDX_SHA3_224,
+    BENCH_MODULE_IDX_SHA3_224_DMA,
+#endif /* !WOLFSSL_NOSHA3_224 */
+#if !defined(WOLFSSL_NOSHA3_256)
     BENCH_MODULE_IDX_SHA3_256,
     BENCH_MODULE_IDX_SHA3_256_DMA,
+#endif /* !WOLFSSL_NOSHA3_256 */
+#if !defined(WOLFSSL_NOSHA3_384)
+    BENCH_MODULE_IDX_SHA3_384,
+    BENCH_MODULE_IDX_SHA3_384_DMA,
+#endif /* !WOLFSSL_NOSHA3_384 */
+#if !defined(WOLFSSL_NOSHA3_512)
+    BENCH_MODULE_IDX_SHA3_512,
+    BENCH_MODULE_IDX_SHA3_512_DMA,
+#endif /* !WOLFSSL_NOSHA3_512 */
 #endif /* WOLFSSL_SHA3 */
 
 /* HMAC */
@@ -170,8 +189,22 @@ typedef enum BenchModuleIdx {
     BENCH_MODULE_IDX_HMAC_SHA2_256_DMA,
 #endif /* !(NO_SHA256) */
 #if defined(WOLFSSL_SHA3)
+#if !defined(WOLFSSL_NOSHA3_224)
+    BENCH_MODULE_IDX_HMAC_SHA3_224,
+    BENCH_MODULE_IDX_HMAC_SHA3_224_DMA,
+#endif /* !WOLFSSL_NOSHA3_224 */
+#if !defined(WOLFSSL_NOSHA3_256)
     BENCH_MODULE_IDX_HMAC_SHA3_256,
     BENCH_MODULE_IDX_HMAC_SHA3_256_DMA,
+#endif /* !WOLFSSL_NOSHA3_256 */
+#if !defined(WOLFSSL_NOSHA3_384)
+    BENCH_MODULE_IDX_HMAC_SHA3_384,
+    BENCH_MODULE_IDX_HMAC_SHA3_384_DMA,
+#endif /* !WOLFSSL_NOSHA3_384 */
+#if !defined(WOLFSSL_NOSHA3_512)
+    BENCH_MODULE_IDX_HMAC_SHA3_512,
+    BENCH_MODULE_IDX_HMAC_SHA3_512_DMA,
+#endif /* !WOLFSSL_NOSHA3_512 */
 #endif /* WOLFSSL_SHA3 */
 #endif /* !(NO_HMAC) */
 
@@ -228,7 +261,7 @@ typedef enum BenchModuleIdx {
 #endif /* HAVE_CURVE25519 */
 
 /* ML-DSA */
-#if defined(HAVE_DILITHIUM)
+#if defined(WOLFSSL_HAVE_MLDSA)
 #if !defined(WOLFSSL_NO_ML_DSA_44)
     BENCH_MODULE_IDX_ML_DSA_44_SIGN,
     BENCH_MODULE_IDX_ML_DSA_44_SIGN_DMA,
@@ -253,16 +286,63 @@ typedef enum BenchModuleIdx {
     BENCH_MODULE_IDX_ML_DSA_87_KEY_GEN,
     BENCH_MODULE_IDX_ML_DSA_87_KEY_GEN_DMA,
 #endif /* !(WOLFSSL_NO_ML_DSA_87) */
-#endif /* HAVE_DILITHIUM */
+#endif /* WOLFSSL_HAVE_MLDSA */
+
+/* ML-KEM */
+#if defined(WOLFSSL_HAVE_MLKEM)
+#ifndef WOLFSSL_NO_ML_KEM_512
+    BENCH_MODULE_IDX_ML_KEM_512_KEY_GEN,
+    BENCH_MODULE_IDX_ML_KEM_512_KEY_GEN_DMA,
+    BENCH_MODULE_IDX_ML_KEM_512_ENCAPS,
+    BENCH_MODULE_IDX_ML_KEM_512_ENCAPS_DMA,
+    BENCH_MODULE_IDX_ML_KEM_512_DECAPS,
+    BENCH_MODULE_IDX_ML_KEM_512_DECAPS_DMA,
+#endif /* !WOLFSSL_NO_ML_KEM_512 */
+#ifndef WOLFSSL_NO_ML_KEM_768
+    BENCH_MODULE_IDX_ML_KEM_768_KEY_GEN,
+    BENCH_MODULE_IDX_ML_KEM_768_KEY_GEN_DMA,
+    BENCH_MODULE_IDX_ML_KEM_768_ENCAPS,
+    BENCH_MODULE_IDX_ML_KEM_768_ENCAPS_DMA,
+    BENCH_MODULE_IDX_ML_KEM_768_DECAPS,
+    BENCH_MODULE_IDX_ML_KEM_768_DECAPS_DMA,
+#endif /* !WOLFSSL_NO_ML_KEM_768 */
+#ifndef WOLFSSL_NO_ML_KEM_1024
+    BENCH_MODULE_IDX_ML_KEM_1024_KEY_GEN,
+    BENCH_MODULE_IDX_ML_KEM_1024_KEY_GEN_DMA,
+    BENCH_MODULE_IDX_ML_KEM_1024_ENCAPS,
+    BENCH_MODULE_IDX_ML_KEM_1024_ENCAPS_DMA,
+    BENCH_MODULE_IDX_ML_KEM_1024_DECAPS,
+    BENCH_MODULE_IDX_ML_KEM_1024_DECAPS_DMA,
+#endif /* !WOLFSSL_NO_ML_KEM_1024 */
+#endif /* WOLFSSL_HAVE_MLKEM */
+
+/* LMS (stateful, DMA-only) */
+#if defined(WOLFHSM_CFG_DMA) && defined(WOLFSSL_HAVE_LMS) && \
+    !defined(WOLFSSL_LMS_VERIFY_ONLY)
+    BENCH_MODULE_IDX_LMS_KEY_GEN,
+    BENCH_MODULE_IDX_LMS_SIGN,
+#endif /* WOLFHSM_CFG_DMA && WOLFSSL_HAVE_LMS && !WOLFSSL_LMS_VERIFY_ONLY */
+#if defined(WOLFHSM_CFG_DMA) && defined(WOLFSSL_HAVE_LMS)
+    BENCH_MODULE_IDX_LMS_VERIFY,
+#endif /* WOLFHSM_CFG_DMA && WOLFSSL_HAVE_LMS */
+
+/* XMSS (stateful, DMA-only) */
+#if defined(WOLFHSM_CFG_DMA) && defined(WOLFSSL_HAVE_XMSS) && \
+    !defined(WOLFSSL_XMSS_VERIFY_ONLY)
+    BENCH_MODULE_IDX_XMSS_KEY_GEN,
+    BENCH_MODULE_IDX_XMSS_SIGN,
+#endif /* WOLFHSM_CFG_DMA && WOLFSSL_HAVE_XMSS && !WOLFSSL_XMSS_VERIFY_ONLY */
+#if defined(WOLFHSM_CFG_DMA) && defined(WOLFSSL_HAVE_XMSS)
+    BENCH_MODULE_IDX_XMSS_VERIFY,
+#endif /* WOLFHSM_CFG_DMA && WOLFSSL_HAVE_XMSS */
 #endif /* !(WOLFHSM_CFG_NO_CRYPTO) */
     /* number of modules. This must be the last entry and will be used as the
      * size of the global modules array */
     BENCH_MODULE_IDX_COUNT
 } BenchModuleIdx;
 
-/* Ensure we have enough space for all modules in the context */
-WH_UTILS_STATIC_ASSERT(MAX_BENCH_OPS > BENCH_MODULE_IDX_COUNT,
-                       "More modules expected than MAX_BENCH_OPS");
+/* Storage for the registered operations, one per module */
+static whBenchOp g_benchOps[BENCH_MODULE_IDX_COUNT];
 
 /* clang-format off */
 static BenchModule g_benchModules[] = {
@@ -344,8 +424,22 @@ static BenchModule g_benchModules[] = {
 #endif /* WOLFSSL_SHA512 */
     /* SHA3 */
 #if defined(WOLFSSL_SHA3)
-    [BENCH_MODULE_IDX_SHA3_256]                = {"SHA3-256",                     wh_Bench_Mod_Sha3256,               BENCH_THROUGHPUT_NONE, 0, NULL},
-    [BENCH_MODULE_IDX_SHA3_256_DMA]            = {"SHA3-256-DMA",                 wh_Bench_Mod_Sha3256Dma,            BENCH_THROUGHPUT_NONE, 0, NULL},
+#if !defined(WOLFSSL_NOSHA3_224)
+    [BENCH_MODULE_IDX_SHA3_224]                = {"SHA3-224",                     wh_Bench_Mod_Sha3224,               BENCH_THROUGHPUT_XBPS, 0, NULL},
+    [BENCH_MODULE_IDX_SHA3_224_DMA]            = {"SHA3-224-DMA",                 wh_Bench_Mod_Sha3224Dma,            BENCH_THROUGHPUT_XBPS, 0, NULL},
+#endif /* !WOLFSSL_NOSHA3_224 */
+#if !defined(WOLFSSL_NOSHA3_256)
+    [BENCH_MODULE_IDX_SHA3_256]                = {"SHA3-256",                     wh_Bench_Mod_Sha3256,               BENCH_THROUGHPUT_XBPS, 0, NULL},
+    [BENCH_MODULE_IDX_SHA3_256_DMA]            = {"SHA3-256-DMA",                 wh_Bench_Mod_Sha3256Dma,            BENCH_THROUGHPUT_XBPS, 0, NULL},
+#endif /* !WOLFSSL_NOSHA3_256 */
+#if !defined(WOLFSSL_NOSHA3_384)
+    [BENCH_MODULE_IDX_SHA3_384]                = {"SHA3-384",                     wh_Bench_Mod_Sha3384,               BENCH_THROUGHPUT_XBPS, 0, NULL},
+    [BENCH_MODULE_IDX_SHA3_384_DMA]            = {"SHA3-384-DMA",                 wh_Bench_Mod_Sha3384Dma,            BENCH_THROUGHPUT_XBPS, 0, NULL},
+#endif /* !WOLFSSL_NOSHA3_384 */
+#if !defined(WOLFSSL_NOSHA3_512)
+    [BENCH_MODULE_IDX_SHA3_512]                = {"SHA3-512",                     wh_Bench_Mod_Sha3512,               BENCH_THROUGHPUT_XBPS, 0, NULL},
+    [BENCH_MODULE_IDX_SHA3_512_DMA]            = {"SHA3-512-DMA",                 wh_Bench_Mod_Sha3512Dma,            BENCH_THROUGHPUT_XBPS, 0, NULL},
+#endif /* !WOLFSSL_NOSHA3_512 */
 #endif /* WOLFSSL_SHA3 */
 
     /* HMAC */
@@ -355,8 +449,22 @@ static BenchModule g_benchModules[] = {
     [BENCH_MODULE_IDX_HMAC_SHA2_256_DMA]       = {"HMAC-SHA2-256-DMA",            wh_Bench_Mod_HmacSha256Dma,         BENCH_THROUGHPUT_XBPS, 0, NULL},
 #endif /* !(NO_SHA256) */
 #if defined(WOLFSSL_SHA3)
-    [BENCH_MODULE_IDX_HMAC_SHA3_256]           = {"HMAC-SHA3-256",                wh_Bench_Mod_HmacSha3256,           BENCH_THROUGHPUT_NONE, 0, NULL},
-    [BENCH_MODULE_IDX_HMAC_SHA3_256_DMA]       = {"HMAC-SHA3-256-DMA",            wh_Bench_Mod_HmacSha3256Dma,        BENCH_THROUGHPUT_NONE, 0, NULL},
+#if !defined(WOLFSSL_NOSHA3_224)
+    [BENCH_MODULE_IDX_HMAC_SHA3_224]           = {"HMAC-SHA3-224",                wh_Bench_Mod_HmacSha3224,           BENCH_THROUGHPUT_XBPS, 0, NULL},
+    [BENCH_MODULE_IDX_HMAC_SHA3_224_DMA]       = {"HMAC-SHA3-224-DMA",            wh_Bench_Mod_HmacSha3224Dma,        BENCH_THROUGHPUT_XBPS, 0, NULL},
+#endif /* !WOLFSSL_NOSHA3_224 */
+#if !defined(WOLFSSL_NOSHA3_256)
+    [BENCH_MODULE_IDX_HMAC_SHA3_256]           = {"HMAC-SHA3-256",                wh_Bench_Mod_HmacSha3256,           BENCH_THROUGHPUT_XBPS, 0, NULL},
+    [BENCH_MODULE_IDX_HMAC_SHA3_256_DMA]       = {"HMAC-SHA3-256-DMA",            wh_Bench_Mod_HmacSha3256Dma,        BENCH_THROUGHPUT_XBPS, 0, NULL},
+#endif /* !WOLFSSL_NOSHA3_256 */
+#if !defined(WOLFSSL_NOSHA3_384)
+    [BENCH_MODULE_IDX_HMAC_SHA3_384]           = {"HMAC-SHA3-384",                wh_Bench_Mod_HmacSha3384,           BENCH_THROUGHPUT_XBPS, 0, NULL},
+    [BENCH_MODULE_IDX_HMAC_SHA3_384_DMA]       = {"HMAC-SHA3-384-DMA",            wh_Bench_Mod_HmacSha3384Dma,        BENCH_THROUGHPUT_XBPS, 0, NULL},
+#endif /* !WOLFSSL_NOSHA3_384 */
+#if !defined(WOLFSSL_NOSHA3_512)
+    [BENCH_MODULE_IDX_HMAC_SHA3_512]           = {"HMAC-SHA3-512",                wh_Bench_Mod_HmacSha3512,           BENCH_THROUGHPUT_XBPS, 0, NULL},
+    [BENCH_MODULE_IDX_HMAC_SHA3_512_DMA]       = {"HMAC-SHA3-512-DMA",            wh_Bench_Mod_HmacSha3512Dma,        BENCH_THROUGHPUT_XBPS, 0, NULL},
+#endif /* !WOLFSSL_NOSHA3_512 */
 #endif /* WOLFSSL_SHA3 */
 #endif /* !(NO_HMAC) */
 
@@ -414,7 +522,7 @@ static BenchModule g_benchModules[] = {
 #endif /* HAVE_CURVE25519 */
 
     /* ML-DSA */
-#if defined(HAVE_DILITHIUM)
+#if defined(WOLFSSL_HAVE_MLDSA)
 #if !defined(WOLFSSL_NO_ML_DSA_44)
     [BENCH_MODULE_IDX_ML_DSA_44_SIGN]          = {"ML-DSA-44-SIGN",               wh_Bench_Mod_MlDsa44Sign,             BENCH_THROUGHPUT_OPS, 0, NULL},
     [BENCH_MODULE_IDX_ML_DSA_44_SIGN_DMA]      = {"ML-DSA-44-SIGN-DMA",           wh_Bench_Mod_MlDsa44SignDma,          BENCH_THROUGHPUT_OPS, 0, NULL},
@@ -439,7 +547,55 @@ static BenchModule g_benchModules[] = {
     [BENCH_MODULE_IDX_ML_DSA_87_KEY_GEN]       = {"ML-DSA-87-KEY-GEN",            wh_Bench_Mod_MlDsa87KeyGen,           BENCH_THROUGHPUT_OPS, 0, NULL},
     [BENCH_MODULE_IDX_ML_DSA_87_KEY_GEN_DMA]   = {"ML-DSA-87-KEY-GEN-DMA",        wh_Bench_Mod_MlDsa87KeyGenDma,        BENCH_THROUGHPUT_OPS, 0, NULL},
 #endif /* !(WOLFSSL_NO_ML_DSA_87) */
-#endif /* HAVE_DILITHIUM */
+#endif /* WOLFSSL_HAVE_MLDSA */
+
+    /* ML-KEM */
+#if defined(WOLFSSL_HAVE_MLKEM)
+#ifndef WOLFSSL_NO_ML_KEM_512
+    [BENCH_MODULE_IDX_ML_KEM_512_KEY_GEN]      = {"ML-KEM-512-KEY-GEN",           wh_Bench_Mod_MlKem512KeyGen,          BENCH_THROUGHPUT_OPS, 0, NULL},
+    [BENCH_MODULE_IDX_ML_KEM_512_KEY_GEN_DMA]  = {"ML-KEM-512-KEY-GEN-DMA",       wh_Bench_Mod_MlKem512KeyGenDma,       BENCH_THROUGHPUT_OPS, 0, NULL},
+    [BENCH_MODULE_IDX_ML_KEM_512_ENCAPS]       = {"ML-KEM-512-ENCAPS",            wh_Bench_Mod_MlKem512Encaps,          BENCH_THROUGHPUT_OPS, 0, NULL},
+    [BENCH_MODULE_IDX_ML_KEM_512_ENCAPS_DMA]   = {"ML-KEM-512-ENCAPS-DMA",        wh_Bench_Mod_MlKem512EncapsDma,       BENCH_THROUGHPUT_OPS, 0, NULL},
+    [BENCH_MODULE_IDX_ML_KEM_512_DECAPS]       = {"ML-KEM-512-DECAPS",            wh_Bench_Mod_MlKem512Decaps,          BENCH_THROUGHPUT_OPS, 0, NULL},
+    [BENCH_MODULE_IDX_ML_KEM_512_DECAPS_DMA]   = {"ML-KEM-512-DECAPS-DMA",        wh_Bench_Mod_MlKem512DecapsDma,       BENCH_THROUGHPUT_OPS, 0, NULL},
+#endif /* !WOLFSSL_NO_ML_KEM_512 */
+#ifndef WOLFSSL_NO_ML_KEM_768
+    [BENCH_MODULE_IDX_ML_KEM_768_KEY_GEN]      = {"ML-KEM-768-KEY-GEN",           wh_Bench_Mod_MlKem768KeyGen,          BENCH_THROUGHPUT_OPS, 0, NULL},
+    [BENCH_MODULE_IDX_ML_KEM_768_KEY_GEN_DMA]  = {"ML-KEM-768-KEY-GEN-DMA",       wh_Bench_Mod_MlKem768KeyGenDma,       BENCH_THROUGHPUT_OPS, 0, NULL},
+    [BENCH_MODULE_IDX_ML_KEM_768_ENCAPS]       = {"ML-KEM-768-ENCAPS",            wh_Bench_Mod_MlKem768Encaps,          BENCH_THROUGHPUT_OPS, 0, NULL},
+    [BENCH_MODULE_IDX_ML_KEM_768_ENCAPS_DMA]   = {"ML-KEM-768-ENCAPS-DMA",        wh_Bench_Mod_MlKem768EncapsDma,       BENCH_THROUGHPUT_OPS, 0, NULL},
+    [BENCH_MODULE_IDX_ML_KEM_768_DECAPS]       = {"ML-KEM-768-DECAPS",            wh_Bench_Mod_MlKem768Decaps,          BENCH_THROUGHPUT_OPS, 0, NULL},
+    [BENCH_MODULE_IDX_ML_KEM_768_DECAPS_DMA]   = {"ML-KEM-768-DECAPS-DMA",        wh_Bench_Mod_MlKem768DecapsDma,       BENCH_THROUGHPUT_OPS, 0, NULL},
+#endif /* !WOLFSSL_NO_ML_KEM_768 */
+#ifndef WOLFSSL_NO_ML_KEM_1024
+    [BENCH_MODULE_IDX_ML_KEM_1024_KEY_GEN]     = {"ML-KEM-1024-KEY-GEN",          wh_Bench_Mod_MlKem1024KeyGen,         BENCH_THROUGHPUT_OPS, 0, NULL},
+    [BENCH_MODULE_IDX_ML_KEM_1024_KEY_GEN_DMA] = {"ML-KEM-1024-KEY-GEN-DMA",      wh_Bench_Mod_MlKem1024KeyGenDma,      BENCH_THROUGHPUT_OPS, 0, NULL},
+    [BENCH_MODULE_IDX_ML_KEM_1024_ENCAPS]      = {"ML-KEM-1024-ENCAPS",           wh_Bench_Mod_MlKem1024Encaps,         BENCH_THROUGHPUT_OPS, 0, NULL},
+    [BENCH_MODULE_IDX_ML_KEM_1024_ENCAPS_DMA]  = {"ML-KEM-1024-ENCAPS-DMA",       wh_Bench_Mod_MlKem1024EncapsDma,      BENCH_THROUGHPUT_OPS, 0, NULL},
+    [BENCH_MODULE_IDX_ML_KEM_1024_DECAPS]      = {"ML-KEM-1024-DECAPS",           wh_Bench_Mod_MlKem1024Decaps,         BENCH_THROUGHPUT_OPS, 0, NULL},
+    [BENCH_MODULE_IDX_ML_KEM_1024_DECAPS_DMA]  = {"ML-KEM-1024-DECAPS-DMA",       wh_Bench_Mod_MlKem1024DecapsDma,      BENCH_THROUGHPUT_OPS, 0, NULL},
+#endif /* !WOLFSSL_NO_ML_KEM_1024 */
+#endif /* WOLFSSL_HAVE_MLKEM */
+
+    /* LMS (stateful, DMA-only) */
+#if defined(WOLFHSM_CFG_DMA) && defined(WOLFSSL_HAVE_LMS) && \
+    !defined(WOLFSSL_LMS_VERIFY_ONLY)
+    [BENCH_MODULE_IDX_LMS_KEY_GEN]             = {"LMS-L1H5W8-KEY-GEN",           wh_Bench_Mod_LmsKeyGen,               BENCH_THROUGHPUT_OPS, 0, NULL},
+    [BENCH_MODULE_IDX_LMS_SIGN]                = {"LMS-L1H5W8-SIGN",              wh_Bench_Mod_LmsSign,                 BENCH_THROUGHPUT_OPS, 0, NULL},
+#endif /* WOLFHSM_CFG_DMA && WOLFSSL_HAVE_LMS && !WOLFSSL_LMS_VERIFY_ONLY */
+#if defined(WOLFHSM_CFG_DMA) && defined(WOLFSSL_HAVE_LMS)
+    [BENCH_MODULE_IDX_LMS_VERIFY]              = {"LMS-L1H5W8-VERIFY",            wh_Bench_Mod_LmsVerify,               BENCH_THROUGHPUT_OPS, 0, NULL},
+#endif /* WOLFHSM_CFG_DMA && WOLFSSL_HAVE_LMS */
+
+    /* XMSS (stateful, DMA-only) */
+#if defined(WOLFHSM_CFG_DMA) && defined(WOLFSSL_HAVE_XMSS) && \
+    !defined(WOLFSSL_XMSS_VERIFY_ONLY)
+    [BENCH_MODULE_IDX_XMSS_KEY_GEN]            = {"XMSS-SHA2_10_256-KEY-GEN",     wh_Bench_Mod_XmssKeyGen,              BENCH_THROUGHPUT_OPS, 0, NULL},
+    [BENCH_MODULE_IDX_XMSS_SIGN]               = {"XMSS-SHA2_10_256-SIGN",        wh_Bench_Mod_XmssSign,                BENCH_THROUGHPUT_OPS, 0, NULL},
+#endif /* WOLFHSM_CFG_DMA && WOLFSSL_HAVE_XMSS && !WOLFSSL_XMSS_VERIFY_ONLY */
+#if defined(WOLFHSM_CFG_DMA) && defined(WOLFSSL_HAVE_XMSS)
+    [BENCH_MODULE_IDX_XMSS_VERIFY]             = {"XMSS-SHA2_10_256-VERIFY",      wh_Bench_Mod_XmssVerify,              BENCH_THROUGHPUT_OPS, 0, NULL},
+#endif /* WOLFHSM_CFG_DMA && WOLFSSL_HAVE_XMSS */
 #endif /* !(WOLFHSM_CFG_NO_CRYPTO) */
 };
 /* clang-format on */
@@ -482,7 +638,7 @@ static int _runClientBenchmarks(whClientContext* client, int transport,
     WH_BENCH_PRINTF("Running benchmarks...\n");
 
     /* Initialize benchmark context */
-    ret = wh_Bench_Init(&benchCtx);
+    ret = wh_Bench_Init(&benchCtx, g_benchOps, BENCH_MODULE_IDX_COUNT);
     if (ret != 0) {
         WH_BENCH_PRINTF("Failed to initialize benchmark context: %d\n", ret);
         return ret;
@@ -699,7 +855,7 @@ int wh_Bench_ClientCtx(whClientContext* client, int transport)
                                 -1); /* -1 means run all modules */
 }
 
-
+#if defined(WOLFHSM_CFG_ENABLE_SERVER)
 int wh_Bench_ServerCfgLoop(whServerConfig* serverCfg)
 {
     whServerContext server[1]    = {0};
@@ -744,8 +900,10 @@ int wh_Bench_ServerCfgLoop(whServerConfig* serverCfg)
 
     return ret;
 }
+#endif /* WOLFHSM_CFG_ENABLE_SERVER */
 
 #if defined(WOLFHSM_CFG_TEST_POSIX)
+#if defined(WOLFHSM_CFG_ENABLE_SERVER)
 typedef struct {
     whClientConfig* config;
     int             moduleIndex;
@@ -898,8 +1056,8 @@ static int _configureClientTransport(whBenchTransportType transport,
             static posixTransportShmClientContext tccShm;
             static posixTransportShmConfig        myshmconfig = {
                        .name      = "wh_bench_shm",
-                       .req_size  = 7000,
-                       .resp_size = 7000,
+                       .req_size  = (uint16_t)BUFFER_SIZE,
+                       .resp_size = (uint16_t)BUFFER_SIZE,
                        .dma_size  = 80000,
             };
             static whCommClientConfig ccShmConf = {
@@ -973,8 +1131,8 @@ static int _configureServerTransport(whBenchTransportType transport,
             static posixTransportShmServerContext tscShm;
             static posixTransportShmConfig        myshmconfig = {
                        .name      = "wh_bench_shm",
-                       .req_size  = 7000,
-                       .resp_size = 7000,
+                       .req_size  = (uint16_t)BUFFER_SIZE,
+                       .resp_size = (uint16_t)BUFFER_SIZE,
                        .dma_size  = 80000,
             };
             static whCommServerConfig csShmConf = {
@@ -1133,7 +1291,7 @@ int wh_Bench_ClientServer_Posix(int transport, int moduleIndex)
     return WH_ERROR_OK;
 }
 
-
+#endif /* WOLFHSM_CFG_ENABLE_SERVER */
 #endif /* WOLFHSM_CFG_TEST_POSIX */
 
 #endif /* WOLFHSM_CFG_BENCH_ENABLE */

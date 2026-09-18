@@ -31,22 +31,23 @@
 #include "wolfhsm/wh_common.h"
 #include "wolfhsm/wh_comm.h"
 #include "wolfhsm/wh_message.h"
-#include "wolfhsm/wh_nvm.h"
 #include "wolfhsm/wh_utils.h"
 
 enum WH_MESSAGE_CERT_ACTION_ENUM {
-    WH_MESSAGE_CERT_ACTION_INIT                  = 0x1,
-    WH_MESSAGE_CERT_ACTION_ADDTRUSTED            = 0x2,
-    WH_MESSAGE_CERT_ACTION_ERASETRUSTED          = 0x3,
-    WH_MESSAGE_CERT_ACTION_READTRUSTED           = 0x4,
-    WH_MESSAGE_CERT_ACTION_VERIFY                = 0x5,
-    WH_MESSAGE_CERT_ACTION_VERIFY_MULTI_ROOT     = 0x6,
-    WH_MESSAGE_CERT_ACTION_ADDTRUSTED_DMA        = 0x22,
-    WH_MESSAGE_CERT_ACTION_READTRUSTED_DMA       = 0x24,
-    WH_MESSAGE_CERT_ACTION_VERIFY_DMA            = 0x25,
-    WH_MESSAGE_CERT_ACTION_VERIFY_ACERT          = 0x26,
-    WH_MESSAGE_CERT_ACTION_VERIFY_ACERT_DMA      = 0x27,
-    WH_MESSAGE_CERT_ACTION_VERIFY_MULTI_ROOT_DMA = 0x28,
+    WH_MESSAGE_CERT_ACTION_INIT                     = 0x1,
+    WH_MESSAGE_CERT_ACTION_ADDTRUSTED               = 0x2,
+    WH_MESSAGE_CERT_ACTION_ERASETRUSTED             = 0x3,
+    WH_MESSAGE_CERT_ACTION_READTRUSTED              = 0x4,
+    WH_MESSAGE_CERT_ACTION_VERIFY                   = 0x5,
+    WH_MESSAGE_CERT_ACTION_VERIFY_MULTI_ROOT        = 0x6,
+    WH_MESSAGE_CERT_ACTION_VERIFY_CACHE_CLEAR       = 0x7,
+    WH_MESSAGE_CERT_ACTION_VERIFY_CACHE_SET_ENABLED = 0x8,
+    WH_MESSAGE_CERT_ACTION_ADDTRUSTED_DMA           = 0x22,
+    WH_MESSAGE_CERT_ACTION_READTRUSTED_DMA          = 0x24,
+    WH_MESSAGE_CERT_ACTION_VERIFY_DMA               = 0x25,
+    WH_MESSAGE_CERT_ACTION_VERIFY_ACERT             = 0x26,
+    WH_MESSAGE_CERT_ACTION_VERIFY_ACERT_DMA         = 0x27,
+    WH_MESSAGE_CERT_ACTION_VERIFY_MULTI_ROOT_DMA    = 0x28,
 };
 
 /* Simple reusable response message */
@@ -58,6 +59,19 @@ typedef struct {
 int wh_MessageCert_TranslateSimpleResponse(
     uint16_t magic, const whMessageCert_SimpleResponse* src,
     whMessageCert_SimpleResponse* dest);
+
+/* VerifyCacheSetEnabled Request */
+typedef struct {
+    uint8_t enable; /* 1 = enable, 0 = disable */
+    uint8_t WH_PAD[7];
+} whMessageCert_SetEnabledRequest;
+
+int wh_MessageCert_TranslateSetEnabledRequest(
+    uint16_t magic, const whMessageCert_SetEnabledRequest* src,
+    whMessageCert_SetEnabledRequest* dest);
+
+/* VerifyCacheSetEnabled Response */
+/* Use SimpleResponse */
 
 /* Init Request/Response */
 /* Empty request message */
@@ -223,9 +237,12 @@ int wh_MessageCert_TranslateVerifyDmaResponse(
  * The root array is inlined at fixed maximum size to keep the request a flat
  * POD; only the first numRoots entries are meaningful.
  *
- * WH_PAD sized so that, with the default WOLFHSM_CFG_CERT_MAX_VERIFY_ROOTS
- * (8), the struct total is a multiple of 8. Users overriding the bound to a
- * non-multiple-of-4 may need to adjust WH_PAD to silence -Wpadded. */
+ * Client and server can be different architectures and built by toolchains that
+ * disagree on uint64_t alignment. The total size must therefore be a multiple
+ * of 8 for any root count, or the two sides get different implicit tail
+ * padding, sizeof no longer matches, and the server rejects every request.
+ * WH_PAD2 adds that padding explicitly when the root array does not end on a
+ * multiple of 8; the asserts below enforce this. */
 typedef struct {
     uint64_t   cert_addr;
     uint32_t   cert_len;
@@ -235,6 +252,10 @@ typedef struct {
     whKeyId    keyId;
     uint8_t    WH_PAD[4];
     whNvmId    trustedRootNvmIds[WOLFHSM_CFG_CERT_MAX_VERIFY_ROOTS];
+#if (WOLFHSM_CFG_CERT_MAX_VERIFY_ROOTS % 4) != 0
+    /* 2 == sizeof(whNvmId) */
+    uint8_t WH_PAD2[8 - 2 * (WOLFHSM_CFG_CERT_MAX_VERIFY_ROOTS % 4)];
+#endif
 } whMessageCert_VerifyMultiRootDmaRequest;
 
 /* The fixed-size DMA request must fit on the wire. If a build overrides
@@ -246,6 +267,13 @@ WH_UTILS_STATIC_ASSERT(sizeof(whMessageCert_VerifyMultiRootDmaRequest) <=
                        "WOLFHSM_CFG_CERT_MAX_VERIFY_ROOTS too large: "
                        "whMessageCert_VerifyMultiRootDmaRequest exceeds "
                        "WOLFHSM_CFG_COMM_DATA_LEN");
+
+/* The server validates this request by exact sizeof, so sizeof must match
+ * across differently-aligning ABIs. A multiple-of-8 total leaves no room for
+ * ABI-dependent tail padding. */
+WH_UTILS_STATIC_ASSERT(
+    (sizeof(whMessageCert_VerifyMultiRootDmaRequest) % 8) == 0,
+    "whMessageCert_VerifyMultiRootDmaRequest size must be a multiple of 8");
 
 int wh_MessageCert_TranslateVerifyMultiRootDmaRequest(
     uint16_t magic, const whMessageCert_VerifyMultiRootDmaRequest* src,

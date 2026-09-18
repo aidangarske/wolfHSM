@@ -93,6 +93,11 @@ typedef int (*whServerImgMgrVerifyMethod)(whServerImgMgrContext* context,
  * It receives the verification result and can perform actions based on
  * whether the verification succeeded or failed.
  *
+ * The action's return value is folded into the verify function's return
+ * value, but cannot mask a verification failure: if the verify method failed,
+ * the verify functions return the method's error even when the action
+ * returns WH_ERROR_OK.
+ *
  * @param[in] context Image manager context
  * @param[in] img Image structure containing verification parameters
  * @param[in] verifyResult Result from the verification method
@@ -119,8 +124,13 @@ typedef struct whServerImgMgrImg {
     whKeyId   keyId;    /* RAW/WOLFBOOT: verify key ID. WOLFBOOT_CERT: unused */
     whNvmId   sigNvmId; /* RAW: sig NVM ID. WOLFBOOT_CERT: root CA NVM ID */
     whServerImgMgrImgType imgType; /* Controls framework loading behavior */
-    whServerImgMgrVerifyMethod verifyMethod; /* Verification callback */
-    whServerImgMgrVerifyAction verifyAction; /* Post-verification action */
+    whServerImgMgrVerifyMethod verifyMethod; /* Verification callback
+                                                (required) */
+    whServerImgMgrVerifyAction
+        verifyAction; /* Post-verification action
+                         (required, use
+                         wh_Server_ImgMgrVerifyActionDefault
+                         for a no-op) */
 } whServerImgMgrImg;
 
 /*
@@ -162,11 +172,14 @@ struct whServerImgMgrContext_t {
  * @brief Initialize the image manager
  *
  * Initializes the image manager context with the provided configuration.
- * Registers the list of images to be managed.
+ * Registers the list of images to be managed. Every registered image must
+ * have both a verifyMethod and a verifyAction callback (use
+ * wh_Server_ImgMgrVerifyActionDefault for a no-op action).
  *
  * @param[in] context Image manager context to initialize
  * @param[in] config Configuration containing image list
- * @return WH_ERROR_OK on success, negative error code on failure
+ * @return WH_ERROR_OK on success, WH_ERROR_BADARGS if the configuration is
+ * invalid or any registered image is missing a callback
  */
 int wh_Server_ImgMgrInit(whServerImgMgrContext*      context,
                          const whServerImgMgrConfig* config);
@@ -176,10 +189,14 @@ int wh_Server_ImgMgrInit(whServerImgMgrContext*      context,
  *
  * Iterates through all registered images and verifies each one.
  * Calls the verification method and action callbacks for each image.
- * Populates detailed verification results for each image.
+ * Populates detailed verification results for each image. Stops at the first
+ * image whose verification returns an error (including a failed signature
+ * check), leaving later images unverified.
  *
  * @param[in] context Image manager context
- * @param[out] outResults Array to store verification results for each image
+ * @param[out] outResults Array to store verification results for each image.
+ * Every entry is initialized to WH_ERROR_ABORTED; entries for images after a
+ * failed one keep that value.
  * @param[in] outResultsCount Number of result slots in the results array (must
  * be == context->imageCount)
  * @param[out] outErrorIdx Holds the index of the image whose verification
@@ -187,7 +204,11 @@ int wh_Server_ImgMgrInit(whServerImgMgrContext*      context,
  * if return value is not WH_ERROR_OK.  If no error occurred, this value is not
  * updated.
  *
- * @return WH_ERROR_OK on success, negative error code on failure.
+ * @return WH_ERROR_OK only when every image verified successfully and every
+ * action callback succeeded. Otherwise returns the first failing image's
+ * error: the verifyMethod error (e.g. WH_ERROR_NOTVERIFIED) on a failed
+ * verification, the verifyAction error on a failed action, or another
+ * negative error code on an operational failure (key or signature load).
  */
 int wh_Server_ImgMgrVerifyAll(whServerImgMgrContext*      context,
                               whServerImgMgrVerifyResult* outResults,
@@ -202,9 +223,14 @@ int wh_Server_ImgMgrVerifyAll(whServerImgMgrContext*      context,
  *
  * @param[in] context Image manager context
  * @param[in] img Image structure to verify
- * @param[out] outResult Verification result. Only valid when function returns
- * WH_ERROR_OK.
- * @return WH_ERROR_OK on success, negative error code on failure
+ * @param[out] outResult Detailed verification results. Fields hold
+ * WH_ERROR_ABORTED for callbacks that were not reached.
+ * @return WH_ERROR_OK only when the image verified successfully and the
+ * action callback succeeded. Returns the verifyMethod error (e.g.
+ * WH_ERROR_NOTVERIFIED) on a failed verification, the verifyAction error on
+ * a failed action, WH_ERROR_NOHANDLER if img is missing a callback, or
+ * another negative error code on an operational failure (key or signature
+ * load).
  */
 int wh_Server_ImgMgrVerifyImg(whServerImgMgrContext*      context,
                               const whServerImgMgrImg*    img,
@@ -218,9 +244,11 @@ int wh_Server_ImgMgrVerifyImg(whServerImgMgrContext*      context,
  *
  * @param[in] context Image manager context
  * @param[in] imgIdx Index of image to verify
- * @param[out] outResult Verification result. Only valid when function returns
- * WH_ERROR_OK.
- * @return WH_ERROR_OK on success, negative error code on failure
+ * @param[out] outResult Detailed verification results. Fields hold
+ * WH_ERROR_ABORTED for callbacks that were not reached.
+ * @return WH_ERROR_OK only when the image verified successfully and the
+ * action callback succeeded; otherwise a negative error code as described
+ * for wh_Server_ImgMgrVerifyImg
  */
 int wh_Server_ImgMgrVerifyImgIdx(whServerImgMgrContext* context, size_t imgIdx,
                                  whServerImgMgrVerifyResult* outResult);

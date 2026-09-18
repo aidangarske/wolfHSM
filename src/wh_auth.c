@@ -184,6 +184,25 @@ int wh_Auth_Logout(whAuthContext* context, whUserId user_id)
 }
 
 
+/* Clears the local session under the auth lock. Fails without clearing if
+ * the lock can not be acquired, to avoid racing an in-flight login. */
+int wh_Auth_Reset(whAuthContext* context)
+{
+    int rc;
+
+    if (context == NULL) {
+        return WH_ERROR_BADARGS;
+    }
+
+    rc = WH_AUTH_LOCK(context);
+    if (rc == WH_ERROR_OK) {
+        memset(&context->user, 0, sizeof(whAuthUser));
+        (void)WH_AUTH_UNLOCK(context);
+    } /* LOCK() */
+    return rc;
+}
+
+
 /* Check on request authorization and action permissions for current user
  * logged in */
 int wh_Auth_CheckRequestAuthorization(whAuthContext* context, uint16_t group,
@@ -312,6 +331,16 @@ int wh_Auth_CheckKeyAuthorization(whAuthContext* context, uint32_t key_id,
 
 /********** API That Manages User Database ******************************/
 
+/*
+ * By default:
+ * 1) Only an admin user can add another admin user.
+ * 2) A non-admin user can only grant the same or a subset of its own
+ *    permissions to a user it creates.
+ * 3) A non-admin user cannot create a user with null credentials.
+ * 4) No duplicate user names are allowed.
+ *
+ * This function adds a new user and returns WH_ERROR_OK on success.
+ */
 int wh_Auth_UserAdd(whAuthContext* context, const char* username,
                     whUserId* out_user_id, whAuthPermissions permissions,
                     whAuthMethod method, const void* credentials,
@@ -326,10 +355,76 @@ int wh_Auth_UserAdd(whAuthContext* context, const char* username,
 
     rc = WH_AUTH_LOCK(context);
     if (rc == WH_ERROR_OK) {
-        /* only an admin level user can add another admin level user */
-        if (WH_AUTH_IS_ADMIN(permissions) &&
-            !WH_AUTH_IS_ADMIN(context->user.permissions)) {
-            rc = WH_AUTH_PERMISSION_ERROR;
+        if (!WH_AUTH_IS_ADMIN(context->user.permissions)) {
+            whAuthPermissions* caller    = &context->user.permissions;
+            int                subsetOk = 1;
+            int                g;
+            int                w;
+
+            /* a non-admin can not add an admin user */
+            if (WH_AUTH_IS_ADMIN(permissions)) {
+                subsetOk = 0;
+            }
+
+            /* new users permissions must be a subset of current users if the
+             * current user is not an admin */
+            for (g = 0; subsetOk && g < WH_NUMBER_OF_GROUPS; g++) {
+                if (permissions.groupPermissions[g] &&
+                    !caller->groupPermissions[g]) {
+                    subsetOk = 0;
+                    break;
+                }
+                for (w = 0; w < (int)WH_AUTH_ACTION_WORDS; w++) {
+                    if (permissions.actionPermissions[g][w] &
+                        ~caller->actionPermissions[g][w]) {
+                        subsetOk = 0;
+                        break;
+                    }
+                }
+            }
+
+            if (subsetOk) {
+                uint16_t reqCount    = permissions.keyIdCount;
+                uint16_t callerCount = caller->keyIdCount;
+                uint16_t k;
+                uint16_t c;
+
+                if (reqCount > WH_AUTH_MAX_KEY_IDS) {
+                    reqCount = WH_AUTH_MAX_KEY_IDS;
+                }
+                if (callerCount > WH_AUTH_MAX_KEY_IDS) {
+                    callerCount = WH_AUTH_MAX_KEY_IDS;
+                }
+                for (k = 0; subsetOk && k < reqCount; k++) {
+                    int found = 0;
+                    for (c = 0; c < callerCount; c++) {
+                        if (caller->keyIds[c] == permissions.keyIds[k]) {
+                            found = 1;
+                            break;
+                        }
+                    }
+
+                    /* check if permissions was a subset of current user
+                     * break out early on the first case */
+                    if (!found) {
+                        subsetOk = 0;
+                        break;
+                    }
+                }
+            }
+
+            /* check that default criteria is met before creating user */
+            if (!subsetOk) {
+                rc = WH_AUTH_PERMISSION_ERROR;
+            }
+            else if (credentials == NULL || credentials_len == 0) {
+                rc = WH_AUTH_PERMISSION_ERROR;
+            }
+            else {
+                rc = context->cb->UserAdd(context->context, username,
+                                          out_user_id, permissions, method,
+                                          credentials, credentials_len);
+            }
         }
         else {
             rc = context->cb->UserAdd(context->context, username, out_user_id,
@@ -380,6 +475,13 @@ int wh_Auth_UserSetPermissions(whAuthContext* context, whUserId user_id,
     rc = context->cb->UserSetPermissions(
         context->context, context->user.user_id, user_id, permissions);
 
+    /* Keep the live session cache in sync when a logged-in user changes its
+     * own permissions; authorization reads only this cache. */
+    if ((rc == WH_ERROR_OK) && (user_id == context->user.user_id) &&
+        (context->user.user_id != WH_USER_ID_INVALID)) {
+        context->user.permissions = permissions;
+    }
+
     (void)WH_AUTH_UNLOCK(context);
     return rc;
 }
@@ -396,8 +498,8 @@ int wh_Auth_UserGet(whAuthContext* context, const char* username,
 
     rc = WH_AUTH_LOCK(context);
     if (rc == WH_ERROR_OK) {
-        rc = context->cb->UserGet(context->context, username, out_user_id,
-                                  out_permissions);
+        rc = context->cb->UserGet(context->context, context->user.user_id,
+                                  username, out_user_id, out_permissions);
 
         (void)WH_AUTH_UNLOCK(context);
     } /* LOCK() */
@@ -421,8 +523,9 @@ int wh_Auth_UserSetCredentials(whAuthContext* context, whUserId user_id,
     rc = WH_AUTH_LOCK(context);
     if (rc == WH_ERROR_OK) {
         rc = context->cb->UserSetCredentials(
-            context->context, user_id, method, current_credentials,
-            current_credentials_len, new_credentials, new_credentials_len);
+            context->context, context->user.user_id, user_id, method,
+            current_credentials, current_credentials_len, new_credentials,
+            new_credentials_len);
 
         (void)WH_AUTH_UNLOCK(context);
     } /* LOCK() */

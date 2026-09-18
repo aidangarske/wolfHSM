@@ -31,6 +31,7 @@
 #include <stdint.h>
 
 #include "wolfhsm/wh_common.h"
+#include "wolfhsm/wh_utils.h"
 
 /* Key Cache Request */
 typedef struct {
@@ -60,6 +61,34 @@ int wh_MessageKeystore_TranslateCacheRequest(
 int wh_MessageKeystore_TranslateCacheResponse(
     uint16_t magic, const whMessageKeystore_CacheResponse* src,
     whMessageKeystore_CacheResponse* dest);
+
+/* Key Cache Random Request
+ * Requests the server to generate a key from its RNG and cache it. No key
+ * material is sent by the client. */
+typedef struct {
+    uint32_t flags;
+    uint32_t labelSz;
+    uint16_t sz;      /* number of random key bytes to generate */
+    uint16_t id;      /* requested keyId, or WH_KEYID_ERASED to auto-assign */
+    uint8_t  WH_PAD[4];
+    uint8_t  label[WH_NVM_LABEL_LEN];
+} whMessageKeystore_CacheRandomRequest;
+
+/* Key Cache Random Response */
+typedef struct {
+    uint32_t rc;
+    uint16_t id;
+    uint8_t  WH_PAD[6];
+} whMessageKeystore_CacheRandomResponse;
+
+/* Key Cache Random translation functions */
+int wh_MessageKeystore_TranslateCacheRandomRequest(
+    uint16_t magic, const whMessageKeystore_CacheRandomRequest* src,
+    whMessageKeystore_CacheRandomRequest* dest);
+
+int wh_MessageKeystore_TranslateCacheRandomResponse(
+    uint16_t magic, const whMessageKeystore_CacheRandomResponse* src,
+    whMessageKeystore_CacheRandomResponse* dest);
 
 /* Key Evict Request */
 typedef struct {
@@ -336,6 +365,34 @@ int wh_MessageKeystore_TranslateKeyWrapResponse(
     uint16_t magic, const whMessageKeystore_KeyWrapResponse* src,
     whMessageKeystore_KeyWrapResponse* dest);
 
+/* Wrap-and-export (by id) Request: wrap a key the server already holds,
+ * identified by keyId, and return the wrapped blob. No data follows. */
+typedef struct {
+    uint16_t keyId;       /* client-facing id (+GLOBAL/WRAPPED flags) to wrap */
+    uint16_t keyType;     /* WH_KEYTYPE_* of the target key (CRYPTO or SHE) */
+    uint16_t serverKeyId; /* KEK (client-facing id) */
+    uint16_t cipherType;  /* enum wc_CipherType */
+} whMessageKeystore_KeyWrapExportRequest;
+
+/* Wrap-and-export (by id) Response */
+typedef struct {
+    uint32_t rc;
+    uint16_t wrappedKeySz;
+    uint16_t cipherType;
+    /* Data follows:
+     * uint8_t wrappedKey[wrappedKeySz]
+     */
+} whMessageKeystore_KeyWrapExportResponse;
+
+/* Wrap-and-export translation functions */
+int wh_MessageKeystore_TranslateKeyWrapExportRequest(
+    uint16_t magic, const whMessageKeystore_KeyWrapExportRequest* src,
+    whMessageKeystore_KeyWrapExportRequest* dest);
+
+int wh_MessageKeystore_TranslateKeyWrapExportResponse(
+    uint16_t magic, const whMessageKeystore_KeyWrapExportResponse* src,
+    whMessageKeystore_KeyWrapExportResponse* dest);
+
 /* Unwrap Key export Request */
 typedef struct {
     uint16_t wrappedKeySz;
@@ -455,5 +512,48 @@ int wh_MessageKeystore_TranslateDataUnwrapRequest(
 int wh_MessageKeystore_TranslateDataUnwrapResponse(
     uint16_t magic, const whMessageKeystore_DataUnwrapResponse* src,
     whMessageKeystore_DataUnwrapResponse* dest);
+
+#if defined(WOLFHSM_CFG_KEYWRAP)
+/* A maximum-sized keywrap payload plus its header must fit the comm data
+ * buffer. On failure, raise COMM_DATA_LEN or lower the keywrap maximum */
+WH_UTILS_STATIC_ASSERT(
+    (uint32_t)sizeof(whMessageKeystore_KeyWrapRequest) +
+            (uint32_t)sizeof(whNvmMetadata) +
+            (uint32_t)WOLFHSM_CFG_KEYWRAP_MAX_KEY_SIZE <=
+        (uint32_t)WOLFHSM_CFG_COMM_DATA_LEN,
+    "WOLFHSM_CFG_KEYWRAP_MAX_KEY_SIZE too large for WOLFHSM_CFG_COMM_DATA_LEN");
+
+WH_UTILS_STATIC_ASSERT(
+    (uint32_t)sizeof(whMessageKeystore_KeyUnwrapAndExportRequest) +
+            (uint32_t)WOLFHSM_CFG_KEYWRAP_MAX_KEY_SIZE <=
+        (uint32_t)WOLFHSM_CFG_COMM_DATA_LEN,
+    "WOLFHSM_CFG_KEYWRAP_MAX_KEY_SIZE too large for WOLFHSM_CFG_COMM_DATA_LEN");
+
+WH_UTILS_STATIC_ASSERT(
+    (uint32_t)sizeof(whMessageKeystore_KeyUnwrapAndCacheRequest) +
+            (uint32_t)WOLFHSM_CFG_KEYWRAP_MAX_KEY_SIZE <=
+        (uint32_t)WOLFHSM_CFG_COMM_DATA_LEN,
+    "WOLFHSM_CFG_KEYWRAP_MAX_KEY_SIZE too large for WOLFHSM_CFG_COMM_DATA_LEN");
+
+WH_UTILS_STATIC_ASSERT((uint32_t)sizeof(whMessageKeystore_DataWrapRequest) +
+                               (uint32_t)WOLFHSM_CFG_KEYWRAP_MAX_DATA_SIZE <=
+                           (uint32_t)WOLFHSM_CFG_COMM_DATA_LEN,
+                       "WOLFHSM_CFG_KEYWRAP_MAX_DATA_SIZE too large for "
+                       "WOLFHSM_CFG_COMM_DATA_LEN");
+
+/* The unwrap request carries the wrap header on top of the maximum plaintext */
+WH_UTILS_STATIC_ASSERT((uint32_t)sizeof(whMessageKeystore_DataUnwrapRequest) +
+                               (uint32_t)WOLFHSM_CFG_KEYWRAP_MAX_DATA_SIZE +
+                               (uint32_t)WH_KEYWRAP_AES_GCM_HEADER_SIZE <=
+                           (uint32_t)WOLFHSM_CFG_COMM_DATA_LEN,
+                       "WOLFHSM_CFG_KEYWRAP_MAX_DATA_SIZE too large for "
+                       "WOLFHSM_CFG_COMM_DATA_LEN");
+
+/* The defaults derive from this overhead, so it must cover the widest header */
+WH_UTILS_STATIC_ASSERT((uint32_t)sizeof(whMessageKeystore_KeyWrapRequest) +
+                               (uint32_t)sizeof(whNvmMetadata) <=
+                           (uint32_t)WH_KEYWRAP_MAX_REQ_OVERHEAD,
+                       "WH_KEYWRAP_MAX_REQ_OVERHEAD is too small");
+#endif /* WOLFHSM_CFG_KEYWRAP */
 
 #endif /* !WOLFHSM_WH_MESSAGE_KEYSTORE_H_ */

@@ -133,9 +133,8 @@ extern "C" {
 #define WOLFSSL_SHA512
 #define WOLFSSL_SHA512_HASHTYPE
 
-/* Dilithium Options */
-#define HAVE_DILITHIUM
-#define WOLFSSL_WC_DILITHIUM /* use wolfCrypt implementation, not libOQS */
+/* ML-DSA Options */
+#define WOLFSSL_HAVE_MLDSA
 #define WOLFSSL_SHA3
 #define WOLFSSL_SHAKE128
 #define WOLFSSL_SHAKE256
@@ -143,17 +142,38 @@ extern "C" {
 /* The following options can be individually controlled to customize the
  * ML-DSA configuration */
 #if 0
-#define WOLFSSL_DILITHIUM_VERIFY_ONLY
+#define WOLFSSL_MLDSA_VERIFY_ONLY
 #endif
 #if 0
-#define WOLFSSL_DILITHIUM_NO_VERIFY
+#define WOLFSSL_MLDSA_NO_VERIFY
 #endif
 #if 0
-#define WOLFSSL_DILITHIUM_NO_SIGN
+#define WOLFSSL_MLDSA_NO_SIGN
 #endif
 #if 0
-#define WOLFSSL_DILITHIUM_NO_MAKE_KEY
+#define WOLFSSL_MLDSA_NO_MAKE_KEY
 #endif
+
+/* The following options can be individually disabled to exclude ML-DSA
+ * levels */
+#if 0
+#define WOLFSSL_NO_ML_DSA_44
+#endif
+#if 0
+#define WOLFSSL_NO_ML_DSA_65
+#endif
+#if 0
+#define WOLFSSL_NO_ML_DSA_87
+#endif
+
+/* ML-KEM Options */
+#define WOLFSSL_HAVE_MLKEM
+
+/* LMS / HSS Options (RFC 8554, NIST SP 800-208) */
+#define WOLFSSL_HAVE_LMS
+
+/* XMSS / XMSS^MT Options (RFC 8391, NIST SP 800-208) */
+#define WOLFSSL_HAVE_XMSS
 
 /** Composite features */
 #define HAVE_HKDF

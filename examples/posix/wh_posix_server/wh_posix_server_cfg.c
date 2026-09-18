@@ -11,9 +11,16 @@
 
 #include "wolfhsm/wh_server.h"
 #include "wolfhsm/wh_error.h"
+#include "wolfhsm/wh_common.h"
 #include "wolfhsm/wh_nvm.h"
 #include "wolfhsm/wh_nvm_flash.h"
 #include "wolfhsm/wh_flash_ramsim.h"
+
+#if defined(WOLFHSM_CFG_KEYWRAP) && defined(WH_POSIX_PROVISION_DEMO_KEK)
+/* For the keywrap demo KEK id and key bytes */
+#include "wh_demo_client_keywrap.h"
+#include "wh_demo_keywrap_kek.h"
+#endif
 #ifdef WOLFHSM_CFG_ENABLE_AUTHENTICATION
 #include "wolfhsm/wh_auth.h"
 #include "wolfhsm/wh_auth_base.h"
@@ -486,8 +493,15 @@ static void parseNvmInitFile(const char* filePath)
 
         /* Parse the file path */
         token = strtok(NULL, " ");
-        if (!token || sscanf(token, "%s", filePath) != 1) {
+        if (!token) {
             WOLFHSM_CFG_PRINTF("Error on line %d: Malformed entry - missing file path\n",
+                    lineNumber);
+            fclose(file);
+            exit(EXIT_FAILURE);
+        }
+        if (snprintf(filePath, sizeof(filePath), "%s", token) >=
+            (int)sizeof(filePath)) {
+            WOLFHSM_CFG_PRINTF("Error on line %d: File path too long\n",
                     lineNumber);
             fclose(file);
             exit(EXIT_FAILURE);
@@ -641,6 +655,33 @@ int wh_PosixServer_ExampleNvmConfig(void* conf, const char* nvmInitFilePath)
         return rc;
     }
 
+#if defined(WOLFHSM_CFG_KEYWRAP) && defined(WH_POSIX_PROVISION_DEMO_KEK)
+    /* Provision the trusted keywrap KEK the demo uses (built with DEMO_KEK=1).
+     * A client can never create a trusted KEK (it cannot set
+     * WH_NVM_FLAGS_TRUSTED), so it is provisioned here the way whnvmtool or
+     * secure boot would on a real device. Gated by a build flag so it stays
+     * off for the client-only test suite, which asserts the server NVM
+     * starts empty. */
+    {
+        whNvmMetadata kekMeta = {0};
+
+        kekMeta.id     = WH_MAKE_KEYID(WH_KEYTYPE_CRYPTO, WH_POSIX_CLIENT_ID,
+                                       WH_DEMO_KEYWRAP_KEK_ID);
+        kekMeta.access = WH_NVM_ACCESS_ANY;
+        kekMeta.flags  = WH_NVM_FLAGS_TRUSTED | WH_NVM_FLAGS_USAGE_WRAP |
+                        WH_NVM_FLAGS_NONEXPORTABLE | WH_NVM_FLAGS_NONMODIFIABLE;
+        kekMeta.len = (whNvmSize)sizeof(whDemoKeywrapKek);
+        memcpy(kekMeta.label, "keywrap demo KEK", sizeof("keywrap demo KEK"));
+
+        rc = wh_Nvm_AddObject(nvm, &kekMeta, kekMeta.len, whDemoKeywrapKek);
+        if (rc != 0) {
+            WOLFHSM_CFG_PRINTF("Failed to provision keywrap demo KEK: %d\n",
+                               rc);
+            return rc;
+        }
+    }
+#endif /* WOLFHSM_CFG_KEYWRAP && WH_POSIX_PROVISION_DEMO_KEK */
+
     /* Initialize NVM with contents from the NVM init file if provided */
     if (nvmInitFilePath != NULL) {
         WOLFHSM_CFG_PRINTF("Initializing NVM with contents from %s\n", nvmInitFilePath);
@@ -685,14 +726,14 @@ static whAuthContext auth_ctx = {0};
  */
 int wh_PosixServer_ExampleAuthConfig(void* conf)
 {
-    int             rc;
-    whServerConfig* s_conf = (whServerConfig*)conf;
-    static void*    auth_backend_context =
-        NULL; /* No backend context needed for stubs */
-    static whAuthConfig auth_config = {0};
-    whAuthPermissions   permissions;
-    uint16_t            out_user_id;
-    int                 i;
+    int                  rc;
+    whServerConfig*      s_conf = (whServerConfig*)conf;
+    static void*         auth_backend_context = NULL;
+    static whAuthConfig  auth_config         = {0};
+    static whAuthBaseConfig auth_base_config = {0};
+    whAuthPermissions    permissions;
+    uint16_t             out_user_id;
+    int                  i;
 
     if (s_conf == NULL) {
         return WH_ERROR_BADARGS;
@@ -701,6 +742,9 @@ int wh_PosixServer_ExampleAuthConfig(void* conf)
     /* Set up the auth config with default callbacks */
     auth_config.cb      = &default_auth_cb;
     auth_config.context = auth_backend_context;
+    /* NVM-backed user database: persist users across server restarts */
+    auth_base_config.nvm = s_conf->nvm;
+    auth_config.config   = &auth_base_config;
 
     /* Initialize the auth context */
     rc = wh_Auth_Init(&auth_ctx, &auth_config);
@@ -713,9 +757,13 @@ int wh_PosixServer_ExampleAuthConfig(void* conf)
     s_conf->auth = &auth_ctx;
 
     WOLFHSM_CFG_PRINTF(
-        "Default auth context configured (stub implementation)\n");
+        "Default auth context configured (%s user database)\n",
+        (s_conf->nvm != NULL) ? "NVM-backed" : "in-memory");
 
-    /* Add an admin user with permissions for everything */
+    /* Add the admin user. Looking it up first is not possible here: the lookup
+     * requires an authenticated caller and no user is logged in during
+     * bootstrap, so add unconditionally and treat a duplicate name as proof it
+     * was already restored from NVM. */
     memset(&permissions, 0xFF, sizeof(whAuthPermissions));
     permissions.keyIdCount = 0;
     for (i = 0; i < WH_AUTH_MAX_KEY_IDS; i++) {
@@ -723,6 +771,10 @@ int wh_PosixServer_ExampleAuthConfig(void* conf)
     }
     rc = wh_Auth_BaseUserAdd(&auth_ctx, "admin", &out_user_id, permissions,
                              WH_AUTH_METHOD_PIN, "1234", 4);
+    if (rc == WH_ERROR_BADARGS) {
+        /* Name already taken, i.e. the admin user came back from NVM */
+        rc = WH_ERROR_OK;
+    }
     if (rc != WH_ERROR_OK) {
         WOLFHSM_CFG_PRINTF("Failed to add admin user: %d\n", rc);
         return rc;

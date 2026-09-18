@@ -24,6 +24,7 @@
 
 #include "wh_test_common.h"
 #include "wh_test_clientserver.h"
+#include "wh_test_dma.h"
 #include "wolfhsm/wh_error.h"
 
 #include "wolfhsm/wh_comm.h"
@@ -406,8 +407,203 @@ static int _testDma(whServerContext* server, whClientContext* client)
                               sizeof(testMem.srvBufAllow),
                               (whServerDmaFlags){0}));
 
+    /* Unregister the allow list: it points at this function's stack-local
+     * testMem, which is about to go out of scope. */
+    WH_TEST_RETURN_ON_FAIL(wh_Server_DmaRegisterAllowList(server, NULL));
+
     return rc;
 }
+
+/*
+ * Drive the keystore/NVM *Dma client APIs end-to-end through the shared
+ * bounce-pool translating DMA callback (see test/wh_test_dma.c). The server can
+ * only touch the pool, so any API that forgets to translate is rejected; the
+ * single-thread pump makes the old KeyCacheDma use-after-free deterministic.
+ * On failure control jumps to cleanup so the callbacks are always unregistered.
+ */
+#define BOUNCE_TEST_NVM_ID 0x4242 /* arbitrary id, destroyed at end of test */
+
+/* Local fail/assert helpers that unwind to cleanup instead of returning. */
+#define BOUNCE_FAIL(expr)                          \
+    do {                                           \
+        if ((rc = (expr)) != WH_ERROR_OK) {        \
+            goto cleanup;                          \
+        }                                          \
+    } while (0)
+#define BOUNCE_ASSERT(cond)                        \
+    do {                                           \
+        if (!(cond)) {                             \
+            WH_ERROR_PRINT("bounce assert failed: %s (line %d)\n", #cond, \
+                           __LINE__);              \
+            rc = WH_ERROR_ABORTED;                 \
+            goto cleanup;                          \
+        }                                          \
+    } while (0)
+
+static int _testClientDmaBounce(whServerContext* server, whClientContext* client)
+{
+    int     rc        = WH_ERROR_OK;
+    int32_t server_rc = 0;
+
+    /* key material to cache + export back */
+    uint8_t  keyIn[32];
+    uint8_t  keyOut[32];
+    uint8_t  labelIn[WH_NVM_LABEL_LEN];
+    uint8_t  labelOut[WH_NVM_LABEL_LEN];
+    uint16_t keyIdIn  = (uint16_t)WH_KEYID_ERASED;
+    uint16_t keyIdOut = 0;
+    uint16_t keyOutSz = sizeof(keyOut);
+
+    /* NVM object to add (server reads) and read back (server writes) */
+    whNvmMetadata meta    = {0};
+    const char*   dataIn  = "bounce-pool-payload";
+    whNvmSize     dataLen = (whNvmSize)strlen(dataIn);
+    uint8_t       dataOut[64];
+
+    WH_TEST_PRINT(
+        "Testing client *Dma APIs through a translating DMA callback...\n");
+
+    whTestDma_BounceReset();
+    memset(keyIn, 0x5A, sizeof(keyIn));
+    memset(labelIn, 0, sizeof(labelIn));
+    (void)snprintf((char*)labelIn, sizeof(labelIn), "bounce-key");
+
+    meta.id     = BOUNCE_TEST_NVM_ID;
+    meta.access = WH_NVM_ACCESS_ANY;
+    meta.flags  = WH_NVM_FLAGS_NONE;
+    meta.len    = dataLen;
+    (void)snprintf((char*)meta.label, sizeof(meta.label), "bounce-obj");
+
+    /* From here on the server can only touch the bounce pool: the server
+     * callback rejects any address the client failed to translate. */
+    BOUNCE_FAIL(wh_Client_DmaRegisterCb(client, whTestDma_BounceClientCb));
+    BOUNCE_FAIL(wh_Server_DmaRegisterCb(server, whTestDma_BounceServerCb));
+
+    /* --- NvmAddObjectDma: server READS metadata + data --- */
+    BOUNCE_FAIL(wh_Client_NvmAddObjectDmaRequest(client, &meta, dataLen,
+                                                 (const uint8_t*)dataIn));
+    BOUNCE_FAIL(wh_Server_HandleRequestMessage(server));
+    BOUNCE_FAIL(wh_Client_NvmAddObjectDmaResponse(client, &server_rc));
+    BOUNCE_ASSERT(server_rc == WH_ERROR_OK);
+    BOUNCE_ASSERT(whTestDma_BounceOutstanding() == 0);
+
+    /* --- NvmReadDma: server WRITES the object's data back --- */
+    memset(dataOut, 0, sizeof(dataOut));
+    BOUNCE_FAIL(wh_Client_NvmReadDmaRequest(client, meta.id, 0, dataLen,
+                                            dataOut));
+    BOUNCE_FAIL(wh_Server_HandleRequestMessage(server));
+    BOUNCE_FAIL(wh_Client_NvmReadDmaResponse(client, &server_rc));
+    BOUNCE_ASSERT(server_rc == WH_ERROR_OK);
+    BOUNCE_ASSERT(0 == memcmp(dataIn, dataOut, dataLen));
+    BOUNCE_ASSERT(whTestDma_BounceOutstanding() == 0);
+
+    /* --- NvmAddObjectDma metadata-only (data == NULL): the data slot is not
+     * populated here. Poison it first; a Request that fails to clear it makes
+     * the Response POST a stale mapping (a stray POST), caught below. --- */
+    client->dma.asyncCtx.nvmAdd.data.xformedAddr = (uintptr_t)0xBADC0DE;
+    client->dma.asyncCtx.nvmAdd.data.clientAddr  = (uintptr_t)0xBADC0DE;
+    client->dma.asyncCtx.nvmAdd.data.sz          = 1; /* would trigger a POST */
+    client->dma.asyncCtx.nvmAdd.data.postOper    = WH_DMA_OPER_CLIENT_READ_POST;
+    {
+        whNvmMetadata metaOnly = {0};
+        whNvmId       moId     = (whNvmId)(BOUNCE_TEST_NVM_ID + 1);
+
+        metaOnly.id     = moId;
+        metaOnly.access = WH_NVM_ACCESS_ANY;
+        metaOnly.flags  = WH_NVM_FLAGS_NONE;
+        metaOnly.len    = 0;
+        (void)snprintf((char*)metaOnly.label, sizeof(metaOnly.label),
+                       "bounce-meta");
+
+        BOUNCE_FAIL(
+            wh_Client_NvmAddObjectDmaRequest(client, &metaOnly, 0, NULL));
+        BOUNCE_FAIL(wh_Server_HandleRequestMessage(server));
+        BOUNCE_FAIL(wh_Client_NvmAddObjectDmaResponse(client, &server_rc));
+        BOUNCE_ASSERT(server_rc == WH_ERROR_OK);
+        BOUNCE_ASSERT(whTestDma_BounceOutstanding() == 0);
+        BOUNCE_ASSERT(whTestDma_BounceStrayPosts() == 0);
+
+        BOUNCE_FAIL(wh_Client_NvmDestroyObjectsRequest(client, 1, &moId));
+        BOUNCE_FAIL(wh_Server_HandleRequestMessage(server));
+        BOUNCE_FAIL(wh_Client_NvmDestroyObjectsResponse(client, &server_rc));
+        BOUNCE_ASSERT(server_rc == WH_ERROR_OK);
+    }
+
+    /* --- Leak recovery on a PRE failure: a Request that fails after acquiring
+     * a mapping must release it. Inject an alloc failure and assert nothing is
+     * left outstanding. No request is sent (PRE fails first), so the comm stays
+     * idle for the cases below. --- */
+    whTestDma_BounceSetAllocBudget(0); /* first PRE fails: nothing acquired */
+    BOUNCE_ASSERT(wh_Client_NvmReadDmaRequest(client, meta.id, 0, dataLen,
+                                              dataOut) != WH_ERROR_OK);
+    BOUNCE_ASSERT(whTestDma_BounceOutstanding() == 0);
+
+    whTestDma_BounceSetAllocBudget(1); /* meta PRE ok, data PRE fails */
+    BOUNCE_ASSERT(wh_Client_NvmAddObjectDmaRequest(
+                      client, &meta, dataLen, (const uint8_t*)dataIn) !=
+                  WH_ERROR_OK);
+    BOUNCE_ASSERT(whTestDma_BounceOutstanding() == 0); /* meta slot released */
+    whTestDma_BounceSetAllocBudget(-1);                /* restore unlimited */
+    BOUNCE_ASSERT(whTestDma_BounceStrayPosts() == 0);
+
+    /* --- KeyCacheDma (server READS) then KeyExportDma (server WRITES): the
+     * use-after-free guard. If KeyCacheDma POSTs inside the Request (the old
+     * bug), the key slot is poisoned before the server reads it, the server
+     * caches poison, and the exported key mismatches keyIn below. --- */
+    BOUNCE_FAIL(wh_Client_KeyCacheDmaRequest(client, 0, labelIn, sizeof(labelIn),
+                                             keyIn, sizeof(keyIn), keyIdIn));
+    BOUNCE_FAIL(wh_Server_HandleRequestMessage(server));
+    BOUNCE_FAIL(wh_Client_KeyCacheDmaResponse(client, &keyIdOut));
+    BOUNCE_ASSERT(whTestDma_BounceOutstanding() == 0);
+
+    memset(keyOut, 0, sizeof(keyOut));
+    memset(labelOut, 0, sizeof(labelOut));
+    BOUNCE_FAIL(wh_Client_KeyExportDmaRequest(client, keyIdOut, keyOut,
+                                              sizeof(keyOut)));
+    BOUNCE_FAIL(wh_Server_HandleRequestMessage(server));
+    BOUNCE_FAIL(wh_Client_KeyExportDmaResponse(client, labelOut,
+                                               sizeof(labelOut), &keyOutSz));
+    BOUNCE_ASSERT(keyOutSz == sizeof(keyIn));
+    BOUNCE_ASSERT(0 == memcmp(keyIn, keyOut, sizeof(keyIn)));
+    BOUNCE_ASSERT(0 == memcmp(labelIn, labelOut, sizeof(labelIn)));
+    BOUNCE_ASSERT(whTestDma_BounceOutstanding() == 0);
+
+    /* --- Teeth check: with the client callback removed, the raw client pointer
+     * is outside the pool, so the server callback must reject it. --- */
+    BOUNCE_FAIL(wh_Client_DmaRegisterCb(client, NULL));
+    memset(dataOut, 0, sizeof(dataOut));
+    BOUNCE_FAIL(wh_Client_NvmReadDmaRequest(client, meta.id, 0, dataLen,
+                                            dataOut));
+    BOUNCE_FAIL(wh_Server_HandleRequestMessage(server));
+    BOUNCE_FAIL(wh_Client_NvmReadDmaResponse(client, &server_rc));
+    BOUNCE_ASSERT(server_rc != WH_ERROR_OK);
+
+    /* Remove the test object (normal-path teardown). */
+    BOUNCE_FAIL(wh_Client_DmaRegisterCb(client, whTestDma_BounceClientCb));
+    BOUNCE_FAIL(wh_Client_NvmDestroyObjectsRequest(client, 1, &meta.id));
+    BOUNCE_FAIL(wh_Server_HandleRequestMessage(server));
+    BOUNCE_FAIL(wh_Client_NvmDestroyObjectsResponse(client, &server_rc));
+    BOUNCE_ASSERT(server_rc == WH_ERROR_OK);
+
+    /* No mapping was leaked and no stray/double POST occurred across the run. */
+    BOUNCE_ASSERT(whTestDma_BounceOutstanding() == 0);
+    BOUNCE_ASSERT(whTestDma_BounceStrayPosts() == 0);
+
+    WH_TEST_PRINT("Client *Dma translating-callback tests PASSED\n");
+
+cleanup:
+    /* Always unregister both callbacks so a failure cannot leak the pool-only
+     * enforcement into later tests (both accept NULL). The test object is
+     * removed on the normal path only; on failure the suite aborts and the next
+     * harness instance uses fresh NVM, so we avoid more transport traffic over
+     * a possibly half-processed request. */
+    (void)wh_Client_DmaRegisterCb(client, NULL);
+    (void)wh_Server_DmaRegisterCb(server, NULL);
+    return rc;
+}
+
+#undef BOUNCE_FAIL
+#undef BOUNCE_ASSERT
 #endif /* WOLFHSM_CFG_DMA && WOLFHSM_CFG_ENABLE_CLIENT && \
           WOLFHSM_CFG_ENABLE_SERVER */
 
@@ -425,8 +621,19 @@ static int _testClientCounter(whClientContext* client)
     uint32_t       reclaim_size;
     whNvmId        avail_objects;
     whNvmId        reclaim_objects;
+    whNvmId        baseAvailObjects;
 
     WH_TEST_PRINT("Testing NVM counters...\n");
+
+    /* Capture the available-object baseline before creating any counters.
+     * When the server is configured with an NVM-backed auth manager it stores
+     * user records as NVM objects, so an "empty" NVM is not necessarily
+     * WOLFHSM_CFG_NVM_OBJECT_COUNT objects. */
+    WH_TEST_RETURN_ON_FAIL(rc = wh_Client_NvmGetAvailable(
+                               client, &server_rc, &avail_size, &avail_objects,
+                               &reclaim_size, &reclaim_objects));
+    WH_TEST_ASSERT_RETURN(server_rc == WH_ERROR_OK);
+    baseAvailObjects = avail_objects;
 
     WH_TEST_RETURN_ON_FAIL(wh_Client_CounterReset(client, counterId, &counter));
     WH_TEST_ASSERT_RETURN(counter == 0);
@@ -482,7 +689,7 @@ static int _testClientCounter(whClientContext* client)
             wh_Client_CounterRead(client, (whNvmId)i, &counter));
     }
 
-    /* Ensure NVM is empty */
+    /* Ensure NVM is back to the pre-test baseline */
     WH_TEST_RETURN_ON_FAIL(rc = wh_Client_NvmGetAvailable(
                                client, &server_rc, &avail_size, &avail_objects,
                                &reclaim_size, &reclaim_objects));
@@ -492,7 +699,7 @@ static int _testClientCounter(whClientContext* client)
         rc, (int)server_rc, (int)avail_size, (int)avail_objects,
         (int)reclaim_size, (int)reclaim_objects);
     WH_TEST_ASSERT_RETURN(server_rc == WH_ERROR_OK);
-    WH_TEST_ASSERT_RETURN(avail_objects == WOLFHSM_CFG_NVM_OBJECT_COUNT);
+    WH_TEST_ASSERT_RETURN(avail_objects == baseAvailObjects);
 
     return WH_ERROR_OK;
 }
@@ -1199,6 +1406,10 @@ int whTest_ClientServerSequential(whTestNvmBackendType nvmType)
 #ifdef WOLFHSM_CFG_DMA
     /* Test DMA callbacks and address allowlisting */
     WH_TEST_RETURN_ON_FAIL(_testDma(server, client));
+
+    /* Drive the client *Dma APIs through a translating callback so a missing
+     * translation is caught on POSIX, not just on cross-domain hardware. */
+    WH_TEST_RETURN_ON_FAIL(_testClientDmaBounce(server, client));
 #endif /* WOLFHSM_CFG_DMA */
 
     /* Check that we are still connected */
@@ -1249,6 +1460,12 @@ int whTest_ClientServerClientConfig(whClientConfig* clientCfg)
     uint32_t reclaim_size = 0;
     whNvmId avail_objects = 0;
     whNvmId reclaim_objects = 0;
+    /* Baseline count of available NVM objects before this test writes any.
+     * When the server is configured with an NVM-backed auth manager it stores
+     * user records as NVM objects, so the empty baseline is not necessarily
+     * WOLFHSM_CFG_NVM_OBJECT_COUNT. Capture it and assert the client's NVM
+     * operations return to this baseline rather than to the absolute maximum. */
+    whNvmId baseAvailObjects = 0;
 
     /* Init client/server comms */
     WH_TEST_RETURN_ON_FAIL(wh_Client_CommInit(client, &client_id, &server_id));
@@ -1292,7 +1509,9 @@ int whTest_ClientServerClientConfig(whClientConfig* clientCfg)
                   ret, (int)server_rc, (int)avail_size, (int)avail_objects,
                   (int)reclaim_size, (int)reclaim_objects);
     WH_TEST_ASSERT_RETURN(server_rc == WH_ERROR_OK);
-    WH_TEST_ASSERT_RETURN(avail_objects == WOLFHSM_CFG_NVM_OBJECT_COUNT);
+    WH_TEST_ASSERT_RETURN(avail_objects <= WOLFHSM_CFG_NVM_OBJECT_COUNT);
+    /* Record the empty baseline (may be reduced by NVM-backed auth records) */
+    baseAvailObjects = avail_objects;
 
     /* Reset NVM state after flag tests */
     WH_TEST_RETURN_ON_FAIL(ret = wh_Client_NvmCleanup(client, &server_rc));
@@ -1304,7 +1523,7 @@ int whTest_ClientServerClientConfig(whClientConfig* clientCfg)
                                client, &server_rc, &avail_size, &avail_objects,
                                &reclaim_size, &reclaim_objects));
     WH_TEST_ASSERT_RETURN(server_rc == WH_ERROR_OK);
-    WH_TEST_ASSERT_RETURN(avail_objects == WOLFHSM_CFG_NVM_OBJECT_COUNT);
+    WH_TEST_ASSERT_RETURN(avail_objects == baseAvailObjects);
 
 
     for (counter = 0; counter < 5; counter++) {
@@ -1384,6 +1603,17 @@ int whTest_ClientServerClientConfig(whClientConfig* clientCfg)
     whNvmFlags  list_flags  = WH_NVM_FLAGS_NONE;
     whNvmId     list_id     = 0;
     whNvmId     list_count  = 0;
+    whNvmId     testIds[5];
+    int         testFound   = 0;
+    int         destroyIdx;
+
+    /* Enumerate every object currently in NVM. When the server is configured
+     * with an NVM-backed auth manager it also stores user records as NVM
+     * objects (at high reserved IDs), so the list is not guaranteed to hold
+     * only the 5 objects this test wrote. Collect the IDs this test owns
+     * (20..24) and leave any other objects (e.g. auth records) untouched so
+     * the available-object count returns to the captured baseline. Reusing
+     * list_id as both the cursor input and result advances through the list. */
     do {
         WH_TEST_RETURN_ON_FAIL(
             ret = wh_Client_NvmList(client, list_access, list_flags, list_id,
@@ -1391,39 +1621,41 @@ int whTest_ClientServerClientConfig(whClientConfig* clientCfg)
         WH_TEST_PRINT("Client NvmList:%d, server_rc:%d count:%u id:%u\n", ret,
                       (int)server_rc, (unsigned int)list_count,
                       (unsigned int)list_id);
+        WH_TEST_ASSERT_RETURN(server_rc == WH_ERROR_OK);
 
-        if (list_count > 0) {
-            /* ensure list_id contains ID of object written, and list_count
-             * shows remaining items in list */
-            WH_TEST_ASSERT_RETURN(list_id == 20 + (5 - list_count));
-
-            WH_TEST_RETURN_ON_FAIL(
-                ret = wh_Client_NvmDestroyObjects(client, 1, &list_id, &server_rc));
-
-            WH_TEST_PRINT("Client NvmDestroyObjects:%d, server_rc:%d for "
-                          "id:%u with count:%u\n",
-                          ret, (int)server_rc, (unsigned int)list_id,
-                          (unsigned int)list_count);
-            WH_TEST_ASSERT_RETURN(server_rc == WH_ERROR_OK);
-
-            /* Ensure object was destroyed and no longer exists */
-            WH_TEST_RETURN_ON_FAIL(ret = wh_Client_NvmGetMetadata(client, list_id, &server_rc, NULL, NULL, NULL, NULL, 0, NULL));
-            WH_TEST_ASSERT_RETURN(WH_ERROR_NOTFOUND == server_rc);
-
-            WH_TEST_PRINT(
-                "Client NvmGetMetadata:%d, server_rc:%d count:%u id:%u\n", ret,
-                (int)server_rc, (unsigned int)list_count,
-                (unsigned int)list_id);
-
-            list_id = 0;
+        if ((list_count > 0) && (list_id >= 20) && (list_id <= 24)) {
+            WH_TEST_ASSERT_RETURN(testFound < 5);
+            testIds[testFound++] = list_id;
         }
     } while (list_count > 0);
+
+    /* This test wrote exactly 5 objects with IDs 20..24 */
+    WH_TEST_ASSERT_RETURN(testFound == 5);
+
+    for (destroyIdx = 0; destroyIdx < testFound; destroyIdx++) {
+        whNvmId destroyId = testIds[destroyIdx];
+
+        WH_TEST_RETURN_ON_FAIL(ret = wh_Client_NvmDestroyObjects(
+                                   client, 1, &destroyId, &server_rc));
+        WH_TEST_PRINT("Client NvmDestroyObjects:%d, server_rc:%d for id:%u\n",
+                      ret, (int)server_rc, (unsigned int)destroyId);
+        WH_TEST_ASSERT_RETURN(server_rc == WH_ERROR_OK);
+
+        /* Ensure object was destroyed and no longer exists */
+        WH_TEST_RETURN_ON_FAIL(ret = wh_Client_NvmGetMetadata(
+                                   client, destroyId, &server_rc, NULL, NULL,
+                                   NULL, NULL, 0, NULL));
+        WH_TEST_ASSERT_RETURN(WH_ERROR_NOTFOUND == server_rc);
+
+        WH_TEST_PRINT("Client NvmGetMetadata:%d, server_rc:%d id:%u\n", ret,
+                      (int)server_rc, (unsigned int)destroyId);
+    }
 
 
     WH_TEST_RETURN_ON_FAIL(wh_Client_NvmGetAvailable(
         client, &server_rc, &avail_size, &avail_objects, &reclaim_size,
         &reclaim_objects));
-    WH_TEST_ASSERT_RETURN(avail_objects == WOLFHSM_CFG_NVM_OBJECT_COUNT);
+    WH_TEST_ASSERT_RETURN(avail_objects == baseAvailObjects);
 
 #ifdef WOLFHSM_CFG_DMA
     /* Same writeback test, but with DMA */
@@ -1538,7 +1770,7 @@ int whTest_ClientServerClientConfig(whClientConfig* clientCfg)
                   ret, (int)server_rc, (int)avail_size, (int)avail_objects,
                   (int)reclaim_size, (int)reclaim_objects);
     WH_TEST_ASSERT_RETURN(server_rc == WH_ERROR_OK);
-    WH_TEST_ASSERT_RETURN(avail_objects == WOLFHSM_CFG_NVM_OBJECT_COUNT);
+    WH_TEST_ASSERT_RETURN(avail_objects == baseAvailObjects);
 
 #endif /* WOLFHSM_CFG_DMA */
 
@@ -1659,6 +1891,7 @@ static void _whClientServerThreadTest(whClientConfig* c_conf,
 
 static int wh_ClientServer_MemThreadTest(whTestNvmBackendType nvmType)
 {
+    int     ret              = WH_ERROR_OK;
     uint8_t req[BUFFER_SIZE] = {0};
     uint8_t resp[BUFFER_SIZE] = {0};
 
@@ -1677,8 +1910,18 @@ static int wh_ClientServer_MemThreadTest(whTestNvmBackendType nvmType)
                  .transport_config  = (void*)tmcf,
                  .client_id         = WH_TEST_DEFAULT_CLIENT_ID,
     }};
+#ifdef WOLFHSM_CFG_DMA
+    /* Route every *Dma op (NVM + cert) through the bounce-pool callback so a
+     * missing translation is rejected (see test/wh_test_dma.c). */
+    whClientDmaConfig clientDmaConfig = {
+        .cb = whTestDma_BounceClientCb,
+    };
+#endif
     whClientConfig c_conf[1] = {{
        .comm = cc_conf,
+#ifdef WOLFHSM_CFG_DMA
+       .dmaConfig = &clientDmaConfig,
+#endif
     }};
     /* Server configuration/contexts */
     whTransportServerCb         tscb[1]   = {WH_TRANSPORT_MEM_SERVER_CB};
@@ -1689,6 +1932,12 @@ static int wh_ClientServer_MemThreadTest(whTestNvmBackendType nvmType)
                  .transport_config  = (void*)tmcf,
                  .server_id         = 124,
     }};
+#ifdef WOLFHSM_CFG_DMA
+    /* Server rejects any untranslated client pointer (out of the pool). */
+    whServerDmaConfig serverDmaConfig = {
+        .cb = whTestDma_BounceServerCb,
+    };
+#endif
 
     /* RamSim Flash state and configuration */
     uint8_t memory[FLASH_RAM_SIZE] = {0};
@@ -1722,15 +1971,38 @@ static int wh_ClientServer_MemThreadTest(whTestNvmBackendType nvmType)
         .crypto = crypto,
         .devId  = INVALID_DEVID,
 #endif
+#ifdef WOLFHSM_CFG_DMA
+        .dmaConfig = &serverDmaConfig,
+#endif
     }};
 
     WH_TEST_RETURN_ON_FAIL(wh_Nvm_Init(nvm, n_conf));
+
+#ifdef WOLFHSM_CFG_DMA
+    whTestDma_BounceReset();
+#endif
 
 #ifndef WOLFHSM_CFG_NO_CRYPTO
     WH_TEST_RETURN_ON_FAIL(wolfCrypt_Init());
     WH_TEST_RETURN_ON_FAIL(wc_InitRng_ex(crypto->rng, NULL, INVALID_DEVID));
 #endif
     _whClientServerThreadTest(c_conf, s_conf);
+
+#ifdef WOLFHSM_CFG_DMA
+    /* No mapping may be outstanding and no POST may have hit a stale slot. */
+    if (whTestDma_BounceOutstanding() != 0) {
+        WH_ERROR_PRINT("wh_test bounce: %d DMA mapping(s) leaked across the "
+                       "clientserver suite\n",
+                       whTestDma_BounceOutstanding());
+        ret = WH_ERROR_ABORTED;
+    }
+    if (whTestDma_BounceStrayPosts() != 0) {
+        WH_ERROR_PRINT("wh_test bounce: %d stray/double DMA POST(s) across the "
+                       "clientserver suite\n",
+                       whTestDma_BounceStrayPosts());
+        ret = WH_ERROR_ABORTED;
+    }
+#endif
 
     wh_Nvm_Cleanup(nvm);
 
@@ -1739,12 +2011,13 @@ static int wh_ClientServer_MemThreadTest(whTestNvmBackendType nvmType)
     wolfCrypt_Cleanup();
 #endif
 
-    return WH_ERROR_OK;
+    return ret;
 }
 
 
 static int wh_ClientServer_PosixMemMapThreadTest(whTestNvmBackendType nvmType)
 {
+    int                     ret     = WH_ERROR_OK;
     posixTransportShmConfig tmcf[1] = {{
         .name       = "/wh_test_clientserver_shm",
         .req_size   = BUFFER_SIZE,
@@ -1760,8 +2033,18 @@ static int wh_ClientServer_PosixMemMapThreadTest(whTestNvmBackendType nvmType)
                     .transport_config  = (void*)tmcf,
                     .client_id         = WH_TEST_DEFAULT_CLIENT_ID,
     }};
+#ifdef WOLFHSM_CFG_DMA
+    /* Route every *Dma op (NVM + cert) through the bounce-pool callback so a
+     * missing translation is rejected (see test/wh_test_dma.c). */
+    whClientDmaConfig clientDmaConfig = {
+        .cb = whTestDma_BounceClientCb,
+    };
+#endif
     whClientConfig                 c_conf[1]  = {{
                          .comm = cc_conf,
+#ifdef WOLFHSM_CFG_DMA
+                         .dmaConfig = &clientDmaConfig,
+#endif
     }};
     /* Server configuration/contexts */
     whTransportServerCb            tscb[1]    = {POSIX_TRANSPORT_SHM_SERVER_CB};
@@ -1772,6 +2055,12 @@ static int wh_ClientServer_PosixMemMapThreadTest(whTestNvmBackendType nvmType)
                     .transport_config  = (void*)tmcf,
                     .server_id         = 124,
     }};
+#ifdef WOLFHSM_CFG_DMA
+    /* Server rejects any untranslated client pointer (out of the pool). */
+    whServerDmaConfig serverDmaConfig = {
+        .cb = whTestDma_BounceServerCb,
+    };
+#endif
 
     /* RamSim Flash state and configuration */
     uint8_t memory[FLASH_RAM_SIZE] = {0};
@@ -1803,6 +2092,9 @@ static int wh_ClientServer_PosixMemMapThreadTest(whTestNvmBackendType nvmType)
 #ifndef WOLFHSM_CFG_NO_CRYPTO
         .crypto = crypto,
 #endif
+#ifdef WOLFHSM_CFG_DMA
+        .dmaConfig = &serverDmaConfig,
+#endif
     }};
 #ifdef WOLFHSM_CFG_ENABLE_AUTHENTICATION
     s_conf->auth = NULL; /* For non authenticated tests set auth context to NULL
@@ -1811,11 +2103,31 @@ static int wh_ClientServer_PosixMemMapThreadTest(whTestNvmBackendType nvmType)
 
     WH_TEST_RETURN_ON_FAIL(wh_Nvm_Init(nvm, n_conf));
 
+#ifdef WOLFHSM_CFG_DMA
+    whTestDma_BounceReset();
+#endif
+
 #ifndef WOLFHSM_CFG_NO_CRYPTO
     WH_TEST_RETURN_ON_FAIL(wolfCrypt_Init());
     WH_TEST_RETURN_ON_FAIL(wc_InitRng_ex(crypto->rng, NULL, INVALID_DEVID));
 #endif
     _whClientServerThreadTest(c_conf, s_conf);
+
+#ifdef WOLFHSM_CFG_DMA
+    /* No mapping may be outstanding and no POST may have hit a stale slot. */
+    if (whTestDma_BounceOutstanding() != 0) {
+        WH_ERROR_PRINT("wh_test bounce: %d DMA mapping(s) leaked across the "
+                       "clientserver suite\n",
+                       whTestDma_BounceOutstanding());
+        ret = WH_ERROR_ABORTED;
+    }
+    if (whTestDma_BounceStrayPosts() != 0) {
+        WH_ERROR_PRINT("wh_test bounce: %d stray/double DMA POST(s) across the "
+                       "clientserver suite\n",
+                       whTestDma_BounceStrayPosts());
+        ret = WH_ERROR_ABORTED;
+    }
+#endif
 
     wh_Nvm_Cleanup(nvm);
 
@@ -1824,7 +2136,7 @@ static int wh_ClientServer_PosixMemMapThreadTest(whTestNvmBackendType nvmType)
     wolfCrypt_Cleanup();
 #endif
 
-    return WH_ERROR_OK;
+    return ret;
 }
 #endif /* WOLFHSM_CFG_TEST_POSIX && WOLFHSM_CFG_ENABLE_CLIENT && \
           WOLFHSM_CFG_ENABLE_SERVER */

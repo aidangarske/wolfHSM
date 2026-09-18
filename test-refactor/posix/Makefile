@@ -12,6 +12,7 @@ BIN = wh_test_refactor
 PROJECT_DIR      ?= .
 REFACTOR_DIR     ?= $(PROJECT_DIR)/..
 CONFIG_DIR       ?= $(REFACTOR_DIR)/../test/config
+REFACTOR_CFG_DIR ?= $(REFACTOR_DIR)/config
 WOLFSSL_DIR      ?= ../../../wolfssl
 WOLFHSM_DIR      ?= $(REFACTOR_DIR)/..
 WOLFHSM_PORT_DIR ?= $(WOLFHSM_DIR)/port/posix
@@ -25,6 +26,7 @@ INC =   -I$(PROJECT_DIR) \
         -I$(REFACTOR_DIR)/server \
         -I$(REFACTOR_DIR)/client-server \
         -I$(REFACTOR_DIR)/misc \
+        -I$(REFACTOR_CFG_DIR) \
         -I$(CONFIG_DIR) \
         -I$(TEST_DIR) \
         -I$(WOLFSSL_DIR) \
@@ -83,6 +85,18 @@ ifeq ($(ASAN),1)
     LDFLAGS += -fsanitize=address
 endif
 
+# ThreadSanitizer. Enables the acquire/release transport shims in the
+# concurrent tests (WOLFHSM_CFG_TEST_STRESS_TSAN) so TSAN's analysis stays on
+# keystore/NVM locking rather than transport false positives.
+ifeq ($(TSAN),1)
+    ifeq ($(ASAN),1)
+        $(error TSAN and ASAN cannot be used together)
+    endif
+    CFLAGS += -fsanitize=thread -fPIE
+    LDFLAGS += -fsanitize=thread -pie
+    DEF += -DWOLFSSL_NO_FENCE -DWOLFHSM_CFG_TEST_STRESS_TSAN
+endif
+
 # Enable threadsafe mode, adding lock protection to shared structures
 ifeq ($(THREADSAFE),1)
     DEF += -DWOLFHSM_CFG_THREADSAFE
@@ -98,14 +112,49 @@ ifeq ($(DMA),1)
     DEF += -DWOLFHSM_CFG_DMA
 endif
 
+# Enable CRC16 integrity checking in the NVM flash backend
+ifeq ($(NVM_FLASH_CRC),1)
+    DEF += -DWOLFHSM_CFG_NVM_FLASH_CRC16
+endif
+
+# Build LMS/XMSS in verify-only mode (omits private-key, sign, and keygen
+# paths). May be combined to exercise the mixed (one verify-only) case.
+ifeq ($(LMS_VERIFY_ONLY),1)
+    DEF += -DWOLFSSL_LMS_VERIFY_ONLY
+endif
+
+ifeq ($(XMSS_VERIFY_ONLY),1)
+    DEF += -DWOLFSSL_XMSS_VERIFY_ONLY
+endif
+
+ifeq ($(MLDSA_VERIFY_ONLY),1)
+    DEF += -DWOLFSSL_MLDSA_VERIFY_ONLY
+endif
+
+ifneq ($(KEYCACHE_BIG_BUFSIZE),)
+    DEF += -DWOLFHSM_CFG_SERVER_KEYCACHE_BIG_BUFSIZE=$(KEYCACHE_BIG_BUFSIZE)
+endif
+
 # Support a SHE-capable build
 ifeq ($(SHE),1)
     DEF += -DWOLFHSM_CFG_SHE_EXTENSION
 endif
 
+# Share all SHE key slots across clients (global SHE device view). Implies
+# SHE=1. WOLFHSM_CFG_GLOBAL_KEYS comes from the test config.
+ifeq ($(SHE_GLOBAL),1)
+    DEF += -DWOLFHSM_CFG_SHE_EXTENSION
+    DEF += -DWOLFHSM_CFG_SHE_GLOBAL_KEYS
+endif
+
 # Support an authentication-capable build
 ifeq ($(AUTH),1)
     DEF += -DWOLFHSM_CFG_ENABLE_AUTHENTICATION
+endif
+
+# Enable per-client crypto affinity (HW/SW devId selection) and its unit test
+ifeq ($(CRYPTO_AFFINITY),1)
+    DEF += -DWOLFHSM_CFG_CRYPTO_AFFINITY
 endif
 
 # Build the wolfCrypt test suite as a wolfHSM client
@@ -150,6 +199,9 @@ ifeq ($(TESTWOLFCRYPT),1)
 
     TESTWOLFCRYPT_DEVID ?= $(TESTWOLFCRYPT_DEFAULT_DEVID)
 
+    # The wolfCrypt test suite drives the HSM through the always-registered
+    # global devIds (TESTWOLFCRYPT_DEVID defaults to WH_DEV_ID;
+    # TESTWOLFCRYPT_DMA uses WH_DEV_ID_DMA).
     DEF += -DWC_USE_DEVID=$(TESTWOLFCRYPT_DEVID)
 
     # wolfCrypt test source files
@@ -180,6 +232,15 @@ SRC_C += $(wildcard $(PROJECT_DIR)/*.c)
 # an empty TU when the gate isn't satisfied.
 SRC_C += $(TEST_DIR)/wh_test_posix_threadsafe_stress.c
 
+# Shared NVM backend selector pulled from test/; provides
+# whTest_NvmCfgBackend for tests that exercise multiple NVM
+# backends (flash and flash-log).
+SRC_C += $(TEST_DIR)/wh_test_common.c
+
+# Shared keywrap test helpers pulled from test/; provides the
+# trusted-KEK test bytes and the SHE wrapped-blob builder.
+SRC_C += $(TEST_DIR)/wh_test_keywrap_util.c
+
 
 ## Build rules
 
@@ -199,6 +260,9 @@ $(BUILD_DIR):
 # -Werror promotes to errors.
 $(BUILD_DIR)/internal.o: CFLAGS += -Wno-error=implicit-function-declaration
 $(BUILD_DIR)/wh_client_crypto.o: CFLAGS += -Wno-error=sign-compare
+
+# Special case: compile-only struct padding check using -Wpadded
+$(BUILD_DIR)/wh_test_check_struct_padding.o: CFLAGS += -Wpadded -DWH_PADDING_CHECK
 
 $(BUILD_DIR)/%.o: %.c
 	@echo "Compiling: $(notdir $<)"
@@ -233,6 +297,7 @@ coverage:
 		--root ../.. \
 		--gcov-executable gcov \
 		--gcov-ignore-parse-errors=negative_hits.warn_once_per_file \
+		--gcov-ignore-parse-errors=suspicious_hits.warn_once_per_file \
 		--filter '\.\./\.\./src/.*' \
 		--filter '\.\./\.\./wolfhsm/.*' \
 		--html-details ../../coverage-refactor/index.html \
@@ -255,15 +320,24 @@ coverage-json:
 	@echo "Generating JSON tracefile at $(OUT)..."
 	mkdir -p $(dir $(OUT)) && gcovr Build \
 		--gcov-ignore-parse-errors=negative_hits.warn_once_per_file \
+		--gcov-ignore-parse-errors=suspicious_hits.warn_once_per_file \
 		--root ../.. \
 		--filter '\.\./\.\./src/.*' \
 		--filter '\.\./\.\./wolfhsm/.*' \
 		--json $(OUT)
 
+# Under TSAN: fail fast and non-zero on any detected race, using the shared
+# suppressions (wolfCrypt internals + SHM transport).
+ifeq ($(TSAN),1)
+    RUN_ENV = TSAN_OPTIONS="halt_on_error=1:exitcode=66:suppressions=$(TEST_DIR)/tsan.supp"
+else
+    RUN_ENV =
+endif
+
 # Send the full test output to test-suite.log, not just the summary
 check run: build_app
 	@rm -f test-suite.log
-	@$(BUILD_DIR)/$(BIN).elf 2>&1 \
+	@$(RUN_ENV) $(BUILD_DIR)/$(BIN).elf 2>&1 \
 	    | tee test-suite.log \
 	    | grep --line-buffered -E \
 	        '^whTest_|^All [0-9]+ tests passed|^[0-9]+ passed, [0-9]+ skipped'; \

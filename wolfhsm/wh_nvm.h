@@ -60,6 +60,9 @@
 #include "wolfhsm/wh_common.h"       /* For whNvm types */
 #include "wolfhsm/wh_keycache.h"     /* For whKeyCacheContext */
 #include "wolfhsm/wh_lock.h"
+#ifdef WOLFHSM_CFG_CERTIFICATE_VERIFY_CACHE_GLOBAL
+#include "wolfhsm/wh_server_cert_cache.h" /* For whCertVerifyCacheContext */
+#endif
 
 /**
  * @brief NVM backend callback table.
@@ -137,6 +140,12 @@ typedef struct whNvmContext_t {
 #if !defined(WOLFHSM_CFG_NO_CRYPTO) && defined(WOLFHSM_CFG_GLOBAL_KEYS)
     whKeyCacheContext globalCache; /**< Global key cache (shared keys) */
 #endif
+#ifdef WOLFHSM_CFG_CERTIFICATE_VERIFY_CACHE_GLOBAL
+    whCertVerifyCacheContext globalCertVerifyCache; /**< Global cross-client
+                                                     * trusted cert verify
+                                                     * cache. Carries its own
+                                                     * dedicated lock. */
+#endif
 #ifdef WOLFHSM_CFG_THREADSAFE
     whLock lock; /**< Lock for serializing NVM and global cache operations */
 #endif
@@ -154,6 +163,16 @@ typedef struct whNvmConfig_t {
 #ifdef WOLFHSM_CFG_THREADSAFE
     whLockConfig*
         lockConfig; /**< Lock configuration (NULL for no-op locking) */
+#ifdef WOLFHSM_CFG_CERTIFICATE_VERIFY_CACHE_GLOBAL
+    whLockConfig* certVerifyCacheLockConfig; /**< Lock config for the global
+                                              * cert verify cache. Independent
+                                              * from lockConfig — pass a
+                                              * separate platform context (e.g.
+                                              * a distinct posixLockContext) so
+                                              * the two locks back distinct
+                                              * mutexes. NULL for no-op
+                                              * locking. */
+#endif
 #endif
 } whNvmConfig;
 
@@ -267,22 +286,32 @@ int wh_Nvm_AddObject(whNvmContext* context, whNvmMetadata* meta,
                      whNvmSize data_len, const uint8_t* data);
 
 /**
- * @brief Adds an object to NVM with policy checking.
+ * @brief Adds an object to NVM with policy checking. Use this for adds driven
+ * by client requests; trusted/internal provisioning should use
+ * wh_Nvm_AddObject().
  *
- * Same as wh_Nvm_AddObject(), but first checks if an existing object with the
- * same ID has the WH_NVM_FLAGS_NONMODIFIABLE flag set. If so, returns an
- * access error.
+ * Same as wh_Nvm_AddObject(), but enforces client policy:
+ * - Rejects the add if an existing object with the same ID is non-modifiable
+ *   (WH_NVM_FLAGS_NONMODIFIABLE) or is a server-only key
+ *   (WH_NVM_FLAGS_TRUSTED).
+ * - Strips the server-only flags (via WH_NVM_FLAGS_SERVER_ONLY bitmask) before
+ * storing, so a client request can never set them. Only the unchecked
+ * wh_Nvm_AddObject() can set those flags. The caller's metadata is copied
+ * internally and left unmodified (meta may point at read-only client DMA
+ * memory).
  *
  * @param[in] context Pointer to the NVM context. Must not be NULL.
- * @param[in,out] meta Pointer to the object metadata. Must not be NULL.
+ * @param[in] meta Pointer to the object metadata. Must not be NULL. Not
+ *                 modified; the server sanitizes an internal copy.
  * @param[in] data_len Length of the object data in bytes.
  * @param[in] data Pointer to the object data.
  * @return int WH_ERROR_OK on success.
- *             WH_ERROR_ACCESS if existing object is non-modifiable.
+ *             WH_ERROR_ACCESS if the existing object is non-modifiable or a
+ *             server-only key.
  *             WH_ERROR_BADARGS if context is NULL or not initialized.
  *             Other negative error codes on backend failure.
  */
-int wh_Nvm_AddObjectChecked(whNvmContext* context, whNvmMetadata* meta,
+int wh_Nvm_AddObjectChecked(whNvmContext* context, const whNvmMetadata* meta,
                             whNvmSize data_len, const uint8_t* data);
 
 /**
@@ -358,15 +387,21 @@ int wh_Nvm_DestroyObjects(whNvmContext* context, whNvmId list_count,
  * @brief Destroys a list of objects from NVM with policy checking.
  *
  * Same as wh_Nvm_DestroyObjects(), but first checks if any object in the list
- * has the WH_NVM_FLAGS_NONMODIFIABLE or WH_NVM_FLAGS_NONDESTROYABLE flags set.
- * If so, returns an access error without destroying any objects.
+ * has the WH_NVM_FLAGS_NONMODIFIABLE or WH_NVM_FLAGS_NONDESTROYABLE flags set,
+ * or is a server-only key (WH_NVM_FLAGS_TRUSTED). If so, returns an access
+ * error without destroying any objects.
+ *
+ * As with wh_Nvm_DestroyObjects(), IDs in the list that are not present do not
+ * cause an error: an absent object carries no flags to enforce and is skipped.
  *
  * @param[in] context Pointer to the NVM context. Must not be NULL.
  * @param[in] list_count Number of IDs in the list.
  * @param[in] id_list Array of object IDs to destroy.
- * @return int WH_ERROR_OK on success.
- *             WH_ERROR_ACCESS if any object is non-modifiable or
- *                             non-destroyable.
+ * @return int WH_ERROR_OK on success, including when some or all IDs are
+ *             not present.
+ *             WH_ERROR_ACCESS if any object is non-modifiable,
+ *                             non-destroyable, or a server-only key. No
+ *                             objects are destroyed.
  *             WH_ERROR_BADARGS if context is NULL, not initialized, or
  *                              id_list is NULL with non-zero list_count.
  *             Other negative error codes on backend failure.
@@ -397,7 +432,8 @@ int wh_Nvm_Read(whNvmContext* context, whNvmId id, whNvmSize offset,
  * @brief Reads data from an NVM object with policy checking.
  *
  * Same as wh_Nvm_Read(), but first checks if the object has the
- * WH_NVM_FLAGS_NONEXPORTABLE flag set. If so, returns an access error.
+ * WH_NVM_FLAGS_NONEXPORTABLE flag set, or is a server-only key
+ * (WH_NVM_FLAGS_TRUSTED). If so, returns an access error.
  *
  * @param[in] context Pointer to the NVM context. Must not be NULL.
  * @param[in] id ID of the object to read from.
@@ -405,7 +441,7 @@ int wh_Nvm_Read(whNvmContext* context, whNvmId id, whNvmSize offset,
  * @param[in] data_len Number of bytes to read.
  * @param[out] data Buffer to store the read data.
  * @return int WH_ERROR_OK on success.
- *             WH_ERROR_ACCESS if object is non-exportable.
+ *             WH_ERROR_ACCESS if object is non-exportable or a server-only key.
  *             WH_ERROR_BADARGS if context is NULL or not initialized.
  *             WH_ERROR_NOTFOUND if the object does not exist.
  *             Other negative error codes on backend failure.

@@ -319,8 +319,12 @@ int wh_Client_Ed25519ExportPublicKey(whClientContext* ctx, whKeyId keyId,
 int wh_Client_Curve25519ExportPublicKey(whClientContext* ctx, whKeyId keyId,
         curve25519_key* key, uint16_t label_len, uint8_t* label);
 int wh_Client_MlDsaExportPublicKey(whClientContext* ctx, whKeyId keyId,
-        MlDsaKey* key, uint16_t label_len, uint8_t* label);
+        wc_MlDsaKey* key, uint16_t label_len, uint8_t* label);
+int wh_Client_MlKemExportPublicKey(whClientContext* ctx, whKeyId keyId,
+        MlKemKey* key, uint16_t label_len, uint8_t* label);
 ```
+
+DERベースのヘルパーとは異なり、ML-KEMは公開鍵を生のワイヤフォーマットバイト列として送信します（サイズは`WC_ML_KEM_MAX_PUBLIC_KEY_SIZE`）。クライアント側のデシリアライザはサポートされているレベルを順に試行します。汎用APIである`wh_Client_KeyExportPublic[Dma]`を直接呼び出す場合は、対応するアルゴリズムセレクタ`WH_KEY_ALGO_MLKEM`を使用します。
 
 例: HSM上でRSAの鍵ペアを生成し秘密鍵を`NONEXPORTABLE`でマークしたうえで、クライアント側で公開鍵を取得し、HSMがキャッシュされた秘密鍵で生成した署名を検証する。
 
@@ -353,7 +357,9 @@ int wh_Client_KeyExportPublicDma(whClientContext* c, whKeyId keyId,
         uint8_t* label, uint16_t labelSz, uint16_t* outSz);
 
 int wh_Client_MlDsaExportPublicKeyDma(whClientContext* ctx, whKeyId keyId,
-        MlDsaKey* key, uint16_t label_len, uint8_t* label);
+        wc_MlDsaKey* key, uint16_t label_len, uint8_t* label);
+int wh_Client_MlKemExportPublicKeyDma(whClientContext* ctx, whKeyId keyId,
+        MlKemKey* key, uint16_t label_len, uint8_t* label);
 ```
 
 `wh_Client_KeyExportPublicDma`は汎用トランスポートで、呼び出し側は生の公開鍵DERを受け取って自身でデシリアライズします。`wh_Client_MlDsaExportPublicKeyDma`は既存の`wh_Client_MlDsaExportKeyDma`に対応するML-DSA専用ヘルパーで、ML-DSAの大きな公開鍵DERを通信バッファにコピーせずに済ませたい場合に使用できます。

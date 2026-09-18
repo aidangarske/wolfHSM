@@ -42,7 +42,7 @@ DEF += -DWOLFHSM_CFG_TEST_POSIX
 ARCHFLAGS ?=
 
 # Enable extra C compiler warnings
-CFLAGS_EXTRA = -Werror -Wall -Wextra
+CFLAGS_EXTRA = -Werror -Wall -Wextra -Wpointer-arith
 # Place functions / data into separate sections to allow unused code removal
 CFLAGS_EXTRA += -ffunction-sections -fdata-sections
 # Auto-generate header dependency files (.d) alongside object files
@@ -142,9 +142,44 @@ ifeq ($(DMA),1)
 	DEF += -DWOLFHSM_CFG_DMA
 endif
 
+# Enable CRC16 integrity checking in the NVM flash backend
+ifeq ($(NVM_FLASH_CRC),1)
+	DEF += -DWOLFHSM_CFG_NVM_FLASH_CRC16
+endif
+
+# Build LMS/XMSS in verify-only mode (omits private-key, sign, and keygen
+# paths). May be combined to exercise the mixed (one verify-only) case.
+ifeq ($(LMS_VERIFY_ONLY),1)
+	DEF += -DWOLFSSL_LMS_VERIFY_ONLY
+endif
+
+ifeq ($(XMSS_VERIFY_ONLY),1)
+	DEF += -DWOLFSSL_XMSS_VERIFY_ONLY
+endif
+
+ifeq ($(MLDSA_VERIFY_ONLY),1)
+	DEF += -DWOLFSSL_MLDSA_VERIFY_ONLY
+endif
+
+ifneq ($(KEYCACHE_BIG_BUFSIZE),)
+	DEF += -DWOLFHSM_CFG_SERVER_KEYCACHE_BIG_BUFSIZE=$(KEYCACHE_BIG_BUFSIZE)
+endif
+
 # Support a SHE-capable build
 ifeq ($(SHE),1)
 	DEF += -DWOLFHSM_CFG_SHE_EXTENSION
+endif
+
+# Share all SHE key slots across clients (global SHE device view). Implies
+# SHE=1. WOLFHSM_CFG_GLOBAL_KEYS comes from the test config.
+ifeq ($(SHE_GLOBAL),1)
+	DEF += -DWOLFHSM_CFG_SHE_EXTENSION
+	DEF += -DWOLFHSM_CFG_SHE_GLOBAL_KEYS
+endif
+
+# Enable per-client crypto affinity (HW/SW devId selection) and its unit test
+ifeq ($(CRYPTO_AFFINITY),1)
+	DEF += -DWOLFHSM_CFG_CRYPTO_AFFINITY
 endif
 
 # Support a TLS-capable build
@@ -163,6 +198,18 @@ endif
 # Support an authentication-capable build
 ifeq ($(AUTH),1)
 	DEF += -DWOLFHSM_CFG_ENABLE_AUTHENTICATION
+endif
+
+# Support trusted-cert verify-result cache
+ifeq ($(CERT_VERIFY_CACHE),1)
+	DEF += -DWOLFHSM_CFG_CERTIFICATE_VERIFY_CACHE
+endif
+
+# Use the cross-client (global) variant of the trusted-cert verify cache.
+# Implies CERT_VERIFY_CACHE.
+ifeq ($(CERT_VERIFY_CACHE_GLOBAL),1)
+	DEF += -DWOLFHSM_CFG_CERTIFICATE_VERIFY_CACHE
+	DEF += -DWOLFHSM_CFG_CERTIFICATE_VERIFY_CACHE_GLOBAL
 endif
 
 ## Project defines
@@ -229,7 +276,9 @@ ifeq ($(TESTWOLFCRYPT),1)
     # Set default TESTWOLFCRYPT_DEVID if not defined by the user
     TESTWOLFCRYPT_DEVID ?= $(TESTWOLFCRYPT_DEFAULT_DEVID)
 
-    # Set the defines for WC_USE_DEVID
+    # Set the defines for WC_USE_DEVID. The wolfCrypt test suite drives the
+    # HSM through the always-registered global devIds (TESTWOLFCRYPT_DEVID
+    # defaults to WH_DEV_ID; TESTWOLFCRYPT_DMA uses WH_DEV_ID_DMA).
     DEF += -DWC_USE_DEVID=$(TESTWOLFCRYPT_DEVID)
 
 	# wolfCrypt test source files
@@ -295,8 +344,13 @@ $(BUILD_DIR)/%.o: %.s
 	@echo "Compiling ASM file: $(notdir $<)"
 	$(CMD_ECHO) $(AS) $(ASFLAGS) $(DEF) $(INC) -c -o $@ $<
 
-# Add additional flag here to avoid pragma
-$(BUILD_DIR)/wh_test_check_struct_padding.o: CFLAGS+=-Wpadded -DWOLFHSM_CFG_NO_CRYPTO
+# Wire-format struct-padding audit. -Wpadded turns spurious padding into a
+# build error. WH_PADDING_CHECK is an internal sentinel honored by
+# wh_settings.h that suppresses external dependencies (wolfSSL etc.) so the
+# audit doesn't drag in third-party source whose layout could perturb the
+# result. Distinct from WOLFHSM_CFG_NO_CRYPTO so it doesn't disable user
+# features (e.g. the cert verify cache).
+$(BUILD_DIR)/wh_test_check_struct_padding.o: CFLAGS+=-Wpadded -DWH_PADDING_CHECK
 
 $(BUILD_DIR)/%.o: %.c
 	@echo "Compiling C file: $(notdir $<)"
@@ -357,6 +411,7 @@ coverage:
 		--root .. \
 		--gcov-executable gcov \
 		--gcov-ignore-parse-errors=negative_hits.warn_once_per_file \
+		--gcov-ignore-parse-errors=suspicious_hits.warn_once_per_file \
 		--filter '\.\./src/.*' \
 		--filter '\.\./wolfhsm/.*' \
 		--html-details ../coverage/index.html \
@@ -379,6 +434,7 @@ coverage-json:
 	@echo "Generating JSON tracefile at $(OUT)..."
 	mkdir -p $(dir $(OUT)) && gcovr Build \
 		--gcov-ignore-parse-errors=negative_hits.warn_once_per_file \
+		--gcov-ignore-parse-errors=suspicious_hits.warn_once_per_file \
 		--root .. \
 		--filter '\.\./src/.*' \
 		--filter '\.\./wolfhsm/.*' \

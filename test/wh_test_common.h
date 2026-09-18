@@ -71,17 +71,32 @@
  * Helper macro for test error propagation
  * Evaluates the "call" argument, and if not equal to zero, displays the
  * stringified call argument along with caller source file info and
- * causes the calling function to return the value of "call"
+ * causes the calling function to return the value of "call".
+ * Use a specific variable name to not overlap with local vars (rc or ret).
  */
-#define WH_TEST_RETURN_ON_FAIL(call)                         \
-    do {                                                     \
-        int ret = (call);                                    \
-        if (ret != WH_TEST_SUCCESS && ret != WH_TEST_SKIP) { \
-            WH_ERROR_PRINT(#call ": ret=%d\n", ret);         \
-            return ret;                                      \
-        }                                                    \
+#define WH_TEST_RETURN_ON_FAIL(call)                                       \
+    do {                                                                   \
+        int _whTestRet = (call);                                           \
+        if (_whTestRet != WH_TEST_SUCCESS && _whTestRet != WH_TEST_SKIP) { \
+            WH_ERROR_PRINT(#call ": ret=%d\n", _whTestRet);                \
+            return _whTestRet;                                             \
+        }                                                                  \
     } while (0)
 
+/* Number of cryptoCb dispatch modes the test suites exercise on the client
+ * devId. With DMA compiled in we run the relevant tests twice -- once with
+ * the standard (non-DMA) path (preferDma=0) and once with DMA preferred
+ * (preferDma=1) -- toggling the client context via wh_Client_SetDmaMode().
+ * Without DMA there is only the std path. The test configs leave
+ * whClientConfig.devId 0, so WH_CLIENT_DEVID resolves to the default global
+ * WH_DEV_ID. The DMA-only WH_DEV_ID_DMA is exercised by running the
+ * wolfCrypt test suite against it (TESTWOLFCRYPT=1 defaults WC_USE_DEVID to
+ * WH_DEV_ID; TESTWOLFCRYPT_DMA=1 uses WH_DEV_ID_DMA). */
+#ifdef WOLFHSM_CFG_DMA
+#define WH_TEST_DMA_MODE_CNT 2
+#else
+#define WH_TEST_DMA_MODE_CNT 1
+#endif
 
 /*
  * Helper macro for test error propagation

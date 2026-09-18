@@ -32,7 +32,6 @@
 #include "wolfhsm/wh_common.h"
 #include "wolfhsm/wh_comm.h"
 #include "wolfhsm/wh_message.h"
-#include "wolfhsm/wh_nvm.h"
 
 enum WH_MESSAGE_NVM_ACTION_ENUM {
     WH_MESSAGE_NVM_ACTION_INIT           = 0x1,
@@ -53,6 +52,11 @@ enum WH_MESSAGE_NVM_MAX_ENUM {
     WH_MESSAGE_NVM_MAX_ADDOBJECT_LEN = WOLFHSM_CFG_COMM_DATA_LEN - sizeof(whNvmMetadata),
     WH_MESSAGE_NVM_MAX_READ_LEN = WOLFHSM_CFG_COMM_DATA_LEN - sizeof(int32_t),
 };
+
+/* Translate a whNvmMetadata carried on the wire as a raw struct, rather than
+ * flattened into message fields. In-place safe (src may equal dest) */
+int wh_MessageNvm_TranslateMetadata(uint16_t magic, const whNvmMetadata* src,
+        whNvmMetadata* dest);
 
 /* Simple reusable response message */
 typedef struct {

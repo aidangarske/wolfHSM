@@ -47,7 +47,22 @@
 #include "wolfhsm/wh_nvm_flash.h"
 #include "wolfhsm/wh_flash_ramsim.h"
 
+#ifndef WOLFHSM_CFG_NO_CRYPTO
+#include "wolfssl/wolfcrypt/settings.h"
+#include "wolfssl/wolfcrypt/types.h"
+#include "wolfssl/wolfcrypt/cryptocb.h"
+#ifdef WOLFHSM_CFG_SHE_EXTENSION
+#include "wolfssl/wolfcrypt/aes.h"
+#include "wolfssl/wolfcrypt/cmac.h"
+#include "wolfhsm/wh_she_common.h"
+#include "wolfhsm/wh_she_crypto.h"
+#include "wolfhsm/wh_client_she.h"
+#include "wolfhsm/wh_message_she.h"
+#endif /* WOLFHSM_CFG_SHE_EXTENSION */
+#endif /* !WOLFHSM_CFG_NO_CRYPTO */
+
 #include "wh_test_common.h"
+#include "wh_test_keywrap_util.h"
 
 /* Test configuration */
 #define FLASH_RAM_SIZE (1024 * 1024)   /* 1MB */
@@ -72,6 +87,15 @@ static const uint8_t TEST_KEY_DATA_3[] = "TestGlobalKey3DataLonger";
 
 #define DUMMY_KEYID_1 1
 #define DUMMY_KEYID_2 2
+
+#ifdef WOLFHSM_CFG_KEYWRAP
+/* Trusted KEK for unwrap-and-cache (bytes: whTest_KeywrapKek). The test setup
+ * provisions it in the shared NVM with WH_NVM_FLAGS_TRUSTED (the way whnvmtool
+ * would), since unwrap-and-cache requires a trusted KEK a client can never
+ * upload. Distinct global id, so it does not collide with the DUMMY_KEYID_*
+ * keys the other tests use. */
+#define WH_TEST_MC_WRAP_KEK_ID 0x30
+#endif /* WOLFHSM_CFG_KEYWRAP */
 
 /* ============================================================================
  * MULTI-CLIENT TEST FRAMEWORK INFRASTRUCTURE
@@ -593,9 +617,8 @@ static int _testGlobalKeyUnwrapCache(whClientContext* client1,
                                      whServerContext* server2)
 {
     int     ret;
-    whKeyId serverKeyId = WH_CLIENT_KEYID_MAKE_GLOBAL(DUMMY_KEYID_1);
-    whKeyId cachedKeyId                = 0;
-    uint8_t wrapKey[AES_256_KEY_SIZE]  = "GlobalUnwrapKey123456789012!";
+    whKeyId serverKeyId = WH_CLIENT_KEYID_MAKE_GLOBAL(WH_TEST_MC_WRAP_KEK_ID);
+    whKeyId cachedKeyId = 0;
     uint8_t plainKey[AES_256_KEY_SIZE] = "KeyToCacheViaUnwrap123456!!";
 #define WRAPPED_KEY_SIZE (12 + 16 + AES_256_KEY_SIZE + sizeof(whNvmMetadata))
     uint8_t       wrappedKey[WRAPPED_KEY_SIZE] = {0};
@@ -608,15 +631,9 @@ static int _testGlobalKeyUnwrapCache(whClientContext* client1,
 
     WH_TEST_PRINT("Test: Key unwrap and cache with global server key\n");
 
-    /* Client 1 caches a global wrapping key */
-    WH_TEST_RETURN_ON_FAIL(wh_Client_KeyCacheRequest_ex(
-        client1, WH_NVM_FLAGS_USAGE_WRAP, (uint8_t*)"UnwrapKey50",
-        sizeof("UnwrapKey50"), wrapKey, sizeof(wrapKey), serverKeyId));
-    WH_TEST_RETURN_ON_FAIL(wh_Server_HandleRequestMessage(server1));
-    WH_TEST_RETURN_ON_FAIL(wh_Client_KeyCacheResponse(client1, &serverKeyId));
-
-    /* Client 1 wraps a global key */
-    serverKeyId = WH_CLIENT_KEYID_MAKE_GLOBAL(DUMMY_KEYID_1);
+    /* The trusted KEK is provisioned in NVM by the test setup; client 1 wraps a
+     * global key under it. */
+    serverKeyId = WH_CLIENT_KEYID_MAKE_GLOBAL(WH_TEST_MC_WRAP_KEK_ID);
     meta.id =
         WH_CLIENT_KEYID_MAKE_WRAPPED_META(WH_KEYUSER_GLOBAL, DUMMY_KEYID_2);
     meta.len    = sizeof(plainKey);
@@ -628,8 +645,8 @@ static int _testGlobalKeyUnwrapCache(whClientContext* client1,
     WH_TEST_RETURN_ON_FAIL(wh_Client_KeyWrapResponse(
         client1, WC_CIPHER_AES_GCM, wrappedKey, &wrappedKeySz));
 
-    /* Client 2 unwraps and caches the key using the global server key */
-    serverKeyId = WH_CLIENT_KEYID_MAKE_GLOBAL(DUMMY_KEYID_1);
+    /* Client 2 unwraps and caches the key using the trusted KEK */
+    serverKeyId = WH_CLIENT_KEYID_MAKE_GLOBAL(WH_TEST_MC_WRAP_KEK_ID);
     ret         = wh_Client_KeyUnwrapAndCacheRequest(client2, WC_CIPHER_AES_GCM,
                                                      serverKeyId, wrappedKey,
                                                      sizeof(wrappedKey));
@@ -658,10 +675,8 @@ static int _testGlobalKeyUnwrapCache(whClientContext* client1,
     WH_TEST_RETURN_ON_FAIL(wh_Server_HandleRequestMessage(server2));
     WH_TEST_RETURN_ON_FAIL(wh_Client_KeyEvictResponse(client2));
 
-    serverKeyId = WH_CLIENT_KEYID_MAKE_GLOBAL(DUMMY_KEYID_1);
-    WH_TEST_RETURN_ON_FAIL(wh_Client_KeyEvictRequest(client1, serverKeyId));
-    WH_TEST_RETURN_ON_FAIL(wh_Server_HandleRequestMessage(server1));
-    WH_TEST_RETURN_ON_FAIL(wh_Client_KeyEvictResponse(client1));
+    /* The KEK is server-owned in NVM (carries WH_NVM_FLAGS_TRUSTED) and is not
+     * client-evictable, so there is nothing to clean up for it here. */
 
     WH_TEST_PRINT("  PASS: Key unwrap and cache with global server key\n");
 
@@ -1098,8 +1113,7 @@ static int _testWrappedKey_LocalWrap_GlobalKey_AnyCacheGlobal(
     whClientContext* client2, whServerContext* server2)
 {
     int     ret;
-    whKeyId serverKeyId                = DUMMY_KEYID_1; /* Local wrapping key */
-    uint8_t wrapKey[AES_256_KEY_SIZE]  = "LocalWrapKey2Test10aXXXXXXXXX!";
+    whKeyId serverKeyId = WH_CLIENT_KEYID_MAKE_GLOBAL(WH_TEST_MC_WRAP_KEK_ID);
     uint8_t plainKey[AES_256_KEY_SIZE] = "GlobalPlainKey2Test10aXXXXXXX!";
 #define WRAPPED_KEY_SIZE (12 + 16 + AES_256_KEY_SIZE + sizeof(whNvmMetadata))
     uint8_t       wrappedKey[WRAPPED_KEY_SIZE]  = {0};
@@ -1113,15 +1127,9 @@ static int _testWrappedKey_LocalWrap_GlobalKey_AnyCacheGlobal(
 
     WH_TEST_DEBUG_PRINT("Test 10a: Local wrap key + Global wrapped key (Cache global)\n");
 
-    /* Client 1 caches a LOCAL wrapping key */
-    WH_TEST_RETURN_ON_FAIL(wh_Client_KeyCacheRequest_ex(
-        client1, WH_NVM_FLAGS_USAGE_WRAP, (uint8_t*)"WrapKey_10a",
-        sizeof("WrapKey_10a"), wrapKey, sizeof(wrapKey), serverKeyId));
-    WH_TEST_RETURN_ON_FAIL(wh_Server_HandleRequestMessage(server1));
-    WH_TEST_RETURN_ON_FAIL(wh_Client_KeyCacheResponse(client1, &serverKeyId));
-
-    /* Client 1 wraps a GLOBAL key (USER=0) */
-    serverKeyId = DUMMY_KEYID_1; /* Use local wrapping key */
+    /* The trusted KEK is provisioned in NVM by the test setup; client 1 wraps a
+     * GLOBAL key (USER=0) under it. */
+    serverKeyId = WH_CLIENT_KEYID_MAKE_GLOBAL(WH_TEST_MC_WRAP_KEK_ID);
     meta.id =
         WH_CLIENT_KEYID_MAKE_WRAPPED_META(WH_KEYUSER_GLOBAL, DUMMY_KEYID_2);
     meta.len = sizeof(plainKey);
@@ -1156,10 +1164,8 @@ static int _testWrappedKey_LocalWrap_GlobalKey_AnyCacheGlobal(
     WH_TEST_RETURN_ON_FAIL(wh_Server_HandleRequestMessage(server2));
     WH_TEST_RETURN_ON_FAIL(wh_Client_KeyEvictResponse(client2));
 
-    serverKeyId = DUMMY_KEYID_1;
-    WH_TEST_RETURN_ON_FAIL(wh_Client_KeyEvictRequest(client1, serverKeyId));
-    WH_TEST_RETURN_ON_FAIL(wh_Server_HandleRequestMessage(server1));
-    WH_TEST_RETURN_ON_FAIL(wh_Client_KeyEvictResponse(client1));
+    /* The KEK is server-owned in NVM (WH_NVM_FLAGS_TRUSTED) and not
+     * client-evictable, so there is nothing to clean up for it here. */
 
     WH_TEST_PRINT("  PASS: Local wrap key + Global wrapped key (Cache global)\n");
 
@@ -1415,6 +1421,483 @@ static int _runGlobalKeysTests(whClientContext* client1,
 #endif /* WOLFHSM_CFG_GLOBAL_KEYS */
 
 /* ============================================================================
+ * GLOBAL SHE KEYS TEST SUITE
+ *
+ * With WOLFHSM_CFG_SHE_GLOBAL_KEYS all SHE slots live in the global-keys
+ * namespace, so the two servers (sharing one NVM and its global cache) act as
+ * one SHE device seen by both clients. Uses the split request/response APIs
+ * since there is no server thread to pump requests.
+ * ========================================================================== */
+
+#if defined(WOLFHSM_CFG_SHE_GLOBAL_KEYS) && !defined(WOLFHSM_CFG_NO_CRYPTO)
+
+/* SHE slots used by this suite */
+#define SHE_MC_USER_SLOT 4
+#define SHE_MC_LOAD_SLOT 5
+#define SHE_MC_PRIME_SLOT 8
+#define SHE_MC_CTR_SLOT 9
+
+/* Provision a SHE slot in the shared NVM, the way ShePreProgramKey does but
+ * with the split API. Counter and SHE flags go in the object label. */
+static int _sheGlobalAddNvmKey(whClientContext* client, whServerContext* server,
+                               uint8_t sheSlot, uint32_t counter,
+                               uint32_t sheFlags, const uint8_t* key)
+{
+    int     ret;
+    int32_t rc                      = 0;
+    uint8_t label[WH_NVM_LABEL_LEN] = {0};
+
+    wh_She_Meta2Label(counter, sheFlags, label);
+    ret = wh_Client_NvmAddObjectRequest(
+        client, WH_SHE_MAKE_KEYID(client->comm->client_id, sheSlot), 0, 0,
+        sizeof(label), label, WH_SHE_KEY_SZ, key);
+    if (ret == 0) {
+        ret = wh_Server_HandleRequestMessage(server);
+    }
+    if (ret == 0) {
+        ret = wh_Client_NvmAddObjectResponse(client, &rc);
+    }
+    if (ret == 0) {
+        ret = (int)rc;
+    }
+    return ret;
+}
+
+/* One ECB encrypt through the given client/server pair */
+static int _sheGlobalEncEcb(whClientContext* client, whServerContext* server,
+                            uint8_t sheSlot, uint8_t* in, uint8_t* out)
+{
+    int ret = wh_Client_SheEncEcbRequest(client, sheSlot, in, WH_SHE_KEY_SZ);
+    if (ret == 0) {
+        ret = wh_Server_HandleRequestMessage(server);
+    }
+    if (ret == 0) {
+        ret = wh_Client_SheEncEcbResponse(client, out, WH_SHE_KEY_SZ);
+    }
+    return ret;
+}
+
+/* Software AES-ECB of one block, the expected value for the server results */
+static int _sheGlobalSwEcb(const uint8_t* key, const uint8_t* in, uint8_t* out)
+{
+    Aes aes[1];
+    int ret = wc_AesInit(aes, NULL, INVALID_DEVID);
+    if (ret == 0) {
+        ret = wc_AesSetKey(aes, key, WH_SHE_KEY_SZ, NULL, AES_ENCRYPTION);
+        if (ret == 0) {
+            ret = wc_AesEncryptDirect(aes, out, in);
+        }
+        wc_AesFree(aes);
+    }
+    return ret;
+}
+
+static int _sheGlobalSetUid(whClientContext* client, whServerContext* server,
+                            uint8_t* uid, uint32_t uidSz)
+{
+    int ret = wh_Client_SheSetUidRequest(client, uid, uidSz);
+    if (ret == 0) {
+        ret = wh_Server_HandleRequestMessage(server);
+    }
+    if (ret == 0) {
+        ret = wh_Client_SheSetUidResponse(client);
+    }
+    return ret;
+}
+
+static int _sheGlobalLoadPlainKey(whClientContext* client,
+                                  whServerContext* server, uint8_t* key)
+{
+    int ret = wh_Client_SheLoadPlainKeyRequest(client, key, WH_SHE_KEY_SZ);
+    if (ret == 0) {
+        ret = wh_Server_HandleRequestMessage(server);
+    }
+    if (ret == 0) {
+        ret = wh_Client_SheLoadPlainKeyResponse(client);
+    }
+    return ret;
+}
+
+/* boot MAC digest = CMAC_bootMacKey(zeros || size || bootloader) */
+static int _sheGlobalComputeBootMac(const uint8_t* bootloader,
+                                    uint32_t       bootloaderSz,
+                                    const uint8_t* bootMacKey,
+                                    uint8_t*       digestOut)
+{
+    int     ret;
+    Cmac    cmac[1];
+    uint8_t zeros[WH_SHE_BOOT_MAC_PREFIX_LEN] = {0};
+    word32  digestSz                          = AES_BLOCK_SIZE;
+
+    if ((ret = wc_InitCmac(cmac, bootMacKey, WH_SHE_KEY_SZ, WC_CMAC_AES,
+                           NULL)) != 0) {
+        return ret;
+    }
+    if ((ret = wc_CmacUpdate(cmac, zeros, sizeof(zeros))) != 0) {
+        return ret;
+    }
+    if ((ret = wc_CmacUpdate(cmac, (const uint8_t*)&bootloaderSz,
+                             sizeof(bootloaderSz))) != 0) {
+        return ret;
+    }
+    if ((ret = wc_CmacUpdate(cmac, bootloader, bootloaderSz)) != 0) {
+        return ret;
+    }
+    return wc_CmacFinal(cmac, digestOut, &digestSz);
+}
+
+/* The secure-boot protocol (INIT / UPDATE / FINISH) only has a blocking
+ * client API, so drive the messages directly and pump the server between
+ * each step. The bootloader used here fits one UPDATE chunk. */
+static int _sheGlobalSecureBoot(whClientContext* client,
+                                whServerContext* server, uint8_t* bootloader,
+                                uint32_t bootloaderLen)
+{
+    int      ret;
+    uint16_t group;
+    uint16_t action;
+    uint16_t dataSz;
+    uint8_t* respBuf;
+
+    whMessageShe_SecureBootInitRequest*    initReq;
+    whMessageShe_SecureBootUpdateRequest*  updateReq;
+    whMessageShe_SecureBootInitResponse*   initResp;
+    whMessageShe_SecureBootUpdateResponse* updateResp;
+    whMessageShe_SecureBootFinishResponse* finishResp;
+
+    if (bootloaderLen >
+        (uint32_t)(WOLFHSM_CFG_COMM_DATA_LEN -
+                   sizeof(whMessageShe_SecureBootUpdateRequest))) {
+        return WH_ERROR_BADARGS;
+    }
+
+    respBuf = (uint8_t*)wh_CommClient_GetDataPtr(client->comm);
+
+    /* INIT: announce the bootloader size */
+    initReq = (whMessageShe_SecureBootInitRequest*)wh_CommClient_GetDataPtr(
+        client->comm);
+    initReq->sz = bootloaderLen;
+    WH_TEST_RETURN_ON_FAIL(wh_Client_SendRequest(
+        client, WH_MESSAGE_GROUP_SHE, WH_SHE_SECURE_BOOT_INIT, sizeof(*initReq),
+        (uint8_t*)initReq));
+    WH_TEST_RETURN_ON_FAIL(wh_Server_HandleRequestMessage(server));
+    ret = wh_Client_RecvResponse(client, &group, &action, &dataSz,
+                                 WOLFHSM_CFG_COMM_DATA_LEN, respBuf);
+    if (ret != WH_ERROR_OK) {
+        return ret;
+    }
+    initResp = (whMessageShe_SecureBootInitResponse*)respBuf;
+    if (initResp->rc != WH_SHE_ERC_NO_ERROR) {
+        return initResp->rc;
+    }
+
+    /* UPDATE: feed the bootloader (single chunk) */
+    updateReq = (whMessageShe_SecureBootUpdateRequest*)wh_CommClient_GetDataPtr(
+        client->comm);
+    updateReq->sz = bootloaderLen;
+    memcpy((uint8_t*)(updateReq + 1), bootloader, bootloaderLen);
+    WH_TEST_RETURN_ON_FAIL(wh_Client_SendRequest(
+        client, WH_MESSAGE_GROUP_SHE, WH_SHE_SECURE_BOOT_UPDATE,
+        (uint16_t)(sizeof(*updateReq) + bootloaderLen), (uint8_t*)updateReq));
+    WH_TEST_RETURN_ON_FAIL(wh_Server_HandleRequestMessage(server));
+    ret = wh_Client_RecvResponse(client, &group, &action, &dataSz,
+                                 WOLFHSM_CFG_COMM_DATA_LEN, respBuf);
+    if (ret != WH_ERROR_OK) {
+        return ret;
+    }
+    updateResp = (whMessageShe_SecureBootUpdateResponse*)respBuf;
+    if (updateResp->rc != WH_SHE_ERC_NO_ERROR) {
+        return updateResp->rc;
+    }
+
+    /* FINISH: verify the boot MAC */
+    WH_TEST_RETURN_ON_FAIL(wh_Client_SendRequest(
+        client, WH_MESSAGE_GROUP_SHE, WH_SHE_SECURE_BOOT_FINISH, 0, NULL));
+    WH_TEST_RETURN_ON_FAIL(wh_Server_HandleRequestMessage(server));
+    ret = wh_Client_RecvResponse(client, &group, &action, &dataSz,
+                                 WOLFHSM_CFG_COMM_DATA_LEN, respBuf);
+    if (ret != WH_ERROR_OK) {
+        return ret;
+    }
+    finishResp = (whMessageShe_SecureBootFinishResponse*)respBuf;
+    return finishResp->rc;
+}
+
+static int _sheGlobalGetStatus(whClientContext* client, whServerContext* server,
+                               uint8_t* sreg)
+{
+    int ret = wh_Client_SheGetStatusRequest(client);
+    if (ret == 0) {
+        ret = wh_Server_HandleRequestMessage(server);
+    }
+    if (ret == 0) {
+        ret = wh_Client_SheGetStatusResponse(client, sreg);
+    }
+    return ret;
+}
+
+#if defined(WOLFHSM_CFG_KEYWRAP) && defined(HAVE_AESGCM)
+static int _sheGlobalUnwrapAndCache(whClientContext* client,
+                                    whServerContext* server, uint8_t* blob,
+                                    uint16_t blobSz, uint16_t* outId)
+{
+    /* The KEK is a global CRYPTO key, so unlike SHE slot ids the client must
+     * name it with the global flag */
+    int ret = wh_Client_KeyUnwrapAndCacheRequest(
+        client, WC_CIPHER_AES_GCM,
+        WH_CLIENT_KEYID_MAKE_GLOBAL(WH_TEST_MC_WRAP_KEK_ID), blob, blobSz);
+    if (ret == 0) {
+        ret = wh_Server_HandleRequestMessage(server);
+    }
+    if (ret == 0) {
+        ret = wh_Client_KeyUnwrapAndCacheResponse(client, WC_CIPHER_AES_GCM,
+                                                  outId);
+    }
+    return ret;
+}
+#endif /* WOLFHSM_CFG_KEYWRAP && HAVE_AESGCM */
+
+static int _runSheGlobalTests(whClientContext* client1,
+                              whServerContext* server1,
+                              whClientContext* client2,
+                              whServerContext* server2)
+{
+    int     ret;
+    int     i;
+    uint8_t sheUid[WH_SHE_UID_SZ];
+    uint8_t secretKey[WH_SHE_KEY_SZ];
+    uint8_t masterKey[WH_SHE_KEY_SZ];
+    uint8_t bootMacKey[WH_SHE_KEY_SZ];
+    uint8_t bootDigest[WH_SHE_KEY_SZ];
+    uint8_t bootloader[64];
+    uint8_t userKey[WH_SHE_KEY_SZ];
+    uint8_t loadKey[WH_SHE_KEY_SZ];
+    uint8_t ramKey[WH_SHE_KEY_SZ];
+    uint8_t ptIn[WH_SHE_KEY_SZ];
+    uint8_t ct1[WH_SHE_KEY_SZ];
+    uint8_t ct2[WH_SHE_KEY_SZ];
+    uint8_t ctSw[WH_SHE_KEY_SZ];
+    uint8_t sreg;
+    uint8_t m1[WH_SHE_M1_SZ];
+    uint8_t m2[WH_SHE_M2_SZ];
+    uint8_t m3[WH_SHE_M3_SZ];
+    uint8_t m4[WH_SHE_M4_SZ];
+    uint8_t m5[WH_SHE_M5_SZ];
+    uint8_t m4Out[WH_SHE_M4_SZ];
+    uint8_t m5Out[WH_SHE_M5_SZ];
+
+    WH_TEST_PRINT("Testing Global SHE Keys...\n");
+
+    for (i = 0; i < (int)sizeof(sheUid); i++) {
+        sheUid[i] = (uint8_t)i;
+    }
+    memset(secretKey, 0xA1, sizeof(secretKey));
+    memset(masterKey, 0xA2, sizeof(masterKey));
+    memset(bootMacKey, 0xA8, sizeof(bootMacKey));
+    memset(bootloader, 0xB7, sizeof(bootloader));
+    memset(userKey, 0xA3, sizeof(userKey));
+    memset(loadKey, 0xA4, sizeof(loadKey));
+    memset(ramKey, 0xA5, sizeof(ramKey));
+    memset(ptIn, 0x11, sizeof(ptIn));
+
+    /* Client 1 provisions the shared SHE slots, including the boot MAC key
+     * and the expected bootloader digest; same UID on both servers */
+    WH_TEST_RETURN_ON_FAIL(_sheGlobalComputeBootMac(
+        bootloader, sizeof(bootloader), bootMacKey, bootDigest));
+    WH_TEST_RETURN_ON_FAIL(_sheGlobalAddNvmKey(
+        client1, server1, WH_SHE_SECRET_KEY_ID, 0, 0, secretKey));
+    WH_TEST_RETURN_ON_FAIL(_sheGlobalAddNvmKey(
+        client1, server1, WH_SHE_MASTER_ECU_KEY_ID, 0, 0, masterKey));
+    WH_TEST_RETURN_ON_FAIL(_sheGlobalAddNvmKey(
+        client1, server1, WH_SHE_BOOT_MAC_KEY_ID, 0, 0, bootMacKey));
+    WH_TEST_RETURN_ON_FAIL(_sheGlobalAddNvmKey(
+        client1, server1, WH_SHE_BOOT_MAC, 0, 0, bootDigest));
+    WH_TEST_RETURN_ON_FAIL(
+        _sheGlobalAddNvmKey(client1, server1, SHE_MC_USER_SLOT, 0, 0, userKey));
+    WH_TEST_RETURN_ON_FAIL(
+        _sheGlobalSetUid(client1, server1, sheUid, sizeof(sheUid)));
+    WH_TEST_RETURN_ON_FAIL(
+        _sheGlobalSetUid(client2, server2, sheUid, sizeof(sheUid)));
+
+    /* Both servers secure boot against the keys client 1 provisioned. The
+     * boot state machine is per server, so each must boot on its own. */
+    WH_TEST_RETURN_ON_FAIL(
+        _sheGlobalSecureBoot(client1, server1, bootloader, sizeof(bootloader)));
+    sreg = 0;
+    WH_TEST_RETURN_ON_FAIL(_sheGlobalGetStatus(client1, server1, &sreg));
+    WH_TEST_ASSERT_RETURN((sreg & WH_SHE_SREG_BOOT_OK) != 0);
+    WH_TEST_RETURN_ON_FAIL(
+        _sheGlobalSecureBoot(client2, server2, bootloader, sizeof(bootloader)));
+    sreg = 0;
+    WH_TEST_RETURN_ON_FAIL(_sheGlobalGetStatus(client2, server2, &sreg));
+    WH_TEST_ASSERT_RETURN((sreg & WH_SHE_SREG_BOOT_OK) != 0);
+    WH_TEST_PRINT("  PASS: Both servers secure boot on shared boot keys\n");
+
+    /* Both clients encrypt with the slot client 1 provisioned */
+    WH_TEST_RETURN_ON_FAIL(
+        _sheGlobalEncEcb(client1, server1, SHE_MC_USER_SLOT, ptIn, ct1));
+    WH_TEST_RETURN_ON_FAIL(
+        _sheGlobalEncEcb(client2, server2, SHE_MC_USER_SLOT, ptIn, ct2));
+    WH_TEST_RETURN_ON_FAIL(_sheGlobalSwEcb(userKey, ptIn, ctSw));
+    WH_TEST_ASSERT_RETURN(memcmp(ct1, ct2, sizeof(ct1)) == 0);
+    WH_TEST_ASSERT_RETURN(memcmp(ct1, ctSw, sizeof(ct1)) == 0);
+    WH_TEST_PRINT("  PASS: Both clients share a provisioned SHE slot\n");
+
+    /* Client 1 installs a key with the LoadKey protocol; client 2 uses it */
+    WH_TEST_RETURN_ON_FAIL(wh_She_GenerateLoadableKey(
+        SHE_MC_LOAD_SLOT, WH_SHE_MASTER_ECU_KEY_ID, 1, 0, sheUid, loadKey,
+        masterKey, m1, m2, m3, m4, m5));
+    WH_TEST_RETURN_ON_FAIL(wh_Client_SheLoadKeyRequest(client1, m1, m2, m3));
+    WH_TEST_RETURN_ON_FAIL(wh_Server_HandleRequestMessage(server1));
+    WH_TEST_RETURN_ON_FAIL(wh_Client_SheLoadKeyResponse(client1, m4Out, m5Out));
+    WH_TEST_ASSERT_RETURN(memcmp(m4Out, m4, sizeof(m4)) == 0);
+    WH_TEST_ASSERT_RETURN(memcmp(m5Out, m5, sizeof(m5)) == 0);
+    WH_TEST_RETURN_ON_FAIL(
+        _sheGlobalEncEcb(client2, server2, SHE_MC_LOAD_SLOT, ptIn, ct2));
+    WH_TEST_RETURN_ON_FAIL(_sheGlobalSwEcb(loadKey, ptIn, ctSw));
+    WH_TEST_ASSERT_RETURN(memcmp(ct2, ctSw, sizeof(ct2)) == 0);
+    WH_TEST_PRINT("  PASS: LoadKey by client 1 visible to client 2\n");
+
+#if defined(WOLFHSM_CFG_KEYWRAP) && defined(HAVE_AESGCM)
+    {
+        uint8_t  blob[128];
+        uint16_t blobSz;
+        uint16_t outId;
+        uint16_t expSz = (uint16_t)(WH_KEYWRAP_AES_GCM_HEADER_SIZE +
+                                    sizeof(whNvmMetadata) + WH_SHE_KEY_SZ);
+        uint8_t  primeKey[WH_SHE_KEY_SZ];
+        uint8_t  ctrKey[WH_SHE_KEY_SZ];
+
+        memset(primeKey, 0xA6, sizeof(primeKey));
+        memset(ctrKey, 0xA7, sizeof(ctrKey));
+
+        /* Wrap-export a SHE slot naming it by raw slot number, no global
+         * flag, under the shared trusted KEK */
+        blobSz = sizeof(blob);
+        WH_TEST_RETURN_ON_FAIL(wh_Client_KeyWrapExportRequest(
+            client1, WC_CIPHER_AES_GCM, SHE_MC_USER_SLOT, WH_KEYTYPE_SHE,
+            WH_CLIENT_KEYID_MAKE_GLOBAL(WH_TEST_MC_WRAP_KEK_ID)));
+        WH_TEST_RETURN_ON_FAIL(wh_Server_HandleRequestMessage(server1));
+        WH_TEST_RETURN_ON_FAIL(wh_Client_KeyWrapExportResponse(
+            client1, WC_CIPHER_AES_GCM, blob, &blobSz));
+        WH_TEST_ASSERT_RETURN(blobSz == expSz);
+        WH_TEST_PRINT("  PASS: Wrap-export of a SHE slot by raw slot id\n");
+
+        /* Client 1 builds a blob for an unused slot, client 2 primes it,
+         * client 1 uses it through the shared global cache */
+        blobSz = sizeof(blob);
+        WH_TEST_RETURN_ON_FAIL(whTest_BuildSheKeyBlob(
+            whTest_KeywrapKek, sizeof(whTest_KeywrapKek),
+            WH_SHE_MAKE_KEYID(client1->comm->client_id, SHE_MC_PRIME_SLOT), 1,
+            0, primeKey, blob, &blobSz));
+        WH_TEST_RETURN_ON_FAIL(
+            _sheGlobalUnwrapAndCache(client2, server2, blob, blobSz, &outId));
+        WH_TEST_ASSERT_RETURN((outId & WH_KEYID_MASK) == SHE_MC_PRIME_SLOT);
+        WH_TEST_ASSERT_RETURN((outId & WH_KEYID_CLIENT_GLOBAL_FLAG) != 0);
+        WH_TEST_RETURN_ON_FAIL(
+            _sheGlobalEncEcb(client1, server1, SHE_MC_PRIME_SLOT, ptIn, ct1));
+        WH_TEST_RETURN_ON_FAIL(_sheGlobalSwEcb(primeKey, ptIn, ctSw));
+        WH_TEST_ASSERT_RETURN(memcmp(ct1, ctSw, sizeof(ct1)) == 0);
+        WH_TEST_PRINT("  PASS: Cross-client unwrap-and-cache prime\n");
+
+        /* Counter guard runs against the globally committed slot */
+        WH_TEST_RETURN_ON_FAIL(_sheGlobalAddNvmKey(
+            client1, server1, SHE_MC_CTR_SLOT, 5, 0, ctrKey));
+        blobSz = sizeof(blob);
+        WH_TEST_RETURN_ON_FAIL(whTest_BuildSheKeyBlob(
+            whTest_KeywrapKek, sizeof(whTest_KeywrapKek),
+            WH_SHE_MAKE_KEYID(client2->comm->client_id, SHE_MC_CTR_SLOT), 3, 0,
+            ctrKey, blob, &blobSz));
+        ret = _sheGlobalUnwrapAndCache(client2, server2, blob, blobSz, &outId);
+        if (ret != WH_ERROR_ACCESS) {
+            WH_ERROR_PRINT("SHE global counter rollback expected ACCESS, got "
+                           "%d\n",
+                           ret);
+            return (ret == 0) ? WH_ERROR_ABORTED : ret;
+        }
+        blobSz = sizeof(blob);
+        WH_TEST_RETURN_ON_FAIL(whTest_BuildSheKeyBlob(
+            whTest_KeywrapKek, sizeof(whTest_KeywrapKek),
+            WH_SHE_MAKE_KEYID(client2->comm->client_id, SHE_MC_CTR_SLOT), 5, 0,
+            ctrKey, blob, &blobSz));
+        WH_TEST_RETURN_ON_FAIL(
+            _sheGlobalUnwrapAndCache(client2, server2, blob, blobSz, &outId));
+        WH_TEST_PRINT("  PASS: Counter guard on a globally committed slot\n");
+    }
+#endif /* WOLFHSM_CFG_KEYWRAP && HAVE_AESGCM */
+
+    /* The RAM key is one shared volatile slot, but the plain-loaded state
+     * that allows exporting it is per server */
+    WH_TEST_RETURN_ON_FAIL(_sheGlobalLoadPlainKey(client1, server1, ramKey));
+    WH_TEST_RETURN_ON_FAIL(
+        _sheGlobalEncEcb(client2, server2, WH_SHE_RAM_KEY_ID, ptIn, ct2));
+    WH_TEST_RETURN_ON_FAIL(_sheGlobalSwEcb(ramKey, ptIn, ctSw));
+    WH_TEST_ASSERT_RETURN(memcmp(ct2, ctSw, sizeof(ct2)) == 0);
+    WH_TEST_RETURN_ON_FAIL(wh_Client_SheExportRamKeyRequest(client2));
+    WH_TEST_RETURN_ON_FAIL(wh_Server_HandleRequestMessage(server2));
+    ret = wh_Client_SheExportRamKeyResponse(client2, m1, m2, m3, m4, m5);
+    if (ret != WH_SHE_ERC_KEY_INVALID) {
+        WH_ERROR_PRINT("SHE global RAM key export without plain load expected "
+                       "KEY_INVALID, got %d\n",
+                       ret);
+        return (ret == 0) ? WH_ERROR_ABORTED : ret;
+    }
+    WH_TEST_RETURN_ON_FAIL(_sheGlobalLoadPlainKey(client2, server2, ramKey));
+    WH_TEST_RETURN_ON_FAIL(wh_Client_SheExportRamKeyRequest(client2));
+    WH_TEST_RETURN_ON_FAIL(wh_Server_HandleRequestMessage(server2));
+    WH_TEST_RETURN_ON_FAIL(
+        wh_Client_SheExportRamKeyResponse(client2, m1, m2, m3, m4, m5));
+    WH_TEST_PRINT("  PASS: Shared RAM key, per-server export state\n");
+
+    /* Cleanup: evict the cached SHE entries (shared global cache, so one
+     * server suffices) and destroy the NVM objects so later suites and the
+     * next fixture run start clean. Clients cannot evict SHE-typed cache
+     * entries, so use the server API directly. */
+    {
+        static const uint8_t evictSlots[] = {
+            WH_SHE_MASTER_ECU_KEY_ID, WH_SHE_BOOT_MAC_KEY_ID, WH_SHE_BOOT_MAC,
+            SHE_MC_USER_SLOT,         SHE_MC_LOAD_SLOT,       SHE_MC_PRIME_SLOT,
+            SHE_MC_CTR_SLOT,          WH_SHE_RAM_KEY_ID,
+        };
+        /* All SHE ids are global here, so the client id argument is moot */
+        whNvmId destroyList[] = {
+            WH_SHE_MAKE_KEYID(0, WH_SHE_SECRET_KEY_ID),
+            WH_SHE_MAKE_KEYID(0, WH_SHE_MASTER_ECU_KEY_ID),
+            WH_SHE_MAKE_KEYID(0, WH_SHE_BOOT_MAC_KEY_ID),
+            WH_SHE_MAKE_KEYID(0, WH_SHE_BOOT_MAC),
+            WH_SHE_MAKE_KEYID(0, SHE_MC_USER_SLOT),
+            WH_SHE_MAKE_KEYID(0, SHE_MC_LOAD_SLOT),
+#if defined(WOLFHSM_CFG_KEYWRAP) && defined(HAVE_AESGCM)
+            /* Only created by the keywrap sub-tests above */
+            WH_SHE_MAKE_KEYID(0, SHE_MC_CTR_SLOT),
+#endif
+        };
+        int32_t rc = 0;
+
+        for (i = 0; i < (int)sizeof(evictSlots); i++) {
+            ret = wh_Server_KeystoreEvictKey(
+                server1,
+                WH_SHE_MAKE_KEYID(client1->comm->client_id, evictSlots[i]));
+            if (ret != 0 && ret != WH_ERROR_NOTFOUND) {
+                return ret;
+            }
+        }
+        WH_TEST_RETURN_ON_FAIL(wh_Client_NvmDestroyObjectsRequest(
+            client1, (whNvmId)(sizeof(destroyList) / sizeof(destroyList[0])),
+            destroyList));
+        WH_TEST_RETURN_ON_FAIL(wh_Server_HandleRequestMessage(server1));
+        WH_TEST_RETURN_ON_FAIL(
+            wh_Client_NvmDestroyObjectsResponse(client1, &rc));
+        WH_TEST_ASSERT_RETURN(rc == 0);
+    }
+
+    WH_TEST_PRINT("All Global SHE Keys Tests PASSED ===\n");
+    return 0;
+}
+
+#endif /* WOLFHSM_CFG_SHE_GLOBAL_KEYS && !WOLFHSM_CFG_NO_CRYPTO */
+
+/* ============================================================================
  * MULTI-CLIENT SEQUENTIAL TEST FRAMEWORK
  * ========================================================================== */
 
@@ -1504,6 +1987,11 @@ static int whTest_MultiClientSequential(void)
     /* Crypto contexts for both servers */
     whServerCryptoContext crypto1[1] = {0};
     whServerCryptoContext crypto2[1] = {0};
+#ifdef WOLFHSM_CFG_SHE_EXTENSION
+    /* SHE contexts for both servers */
+    whServerSheContext she1[1];
+    whServerSheContext she2[1];
+#endif
 #endif
 
     /* Server 1 configuration */
@@ -1520,6 +2008,9 @@ static int whTest_MultiClientSequential(void)
                       .nvm         = nvm, /* Shared NVM */
 #if !defined(WOLFHSM_CFG_NO_CRYPTO)
         .crypto = crypto1,
+#ifdef WOLFHSM_CFG_SHE_EXTENSION
+        .she = she1,
+#endif
 #endif
     }};
     whServerContext server1[1] = {0};
@@ -1539,6 +2030,9 @@ static int whTest_MultiClientSequential(void)
 
 #if !defined(WOLFHSM_CFG_NO_CRYPTO)
         .crypto = crypto2,
+#ifdef WOLFHSM_CFG_SHE_EXTENSION
+        .she = she2,
+#endif
 #endif
     }};
     whServerContext server2[1] = {0};
@@ -1546,6 +2040,11 @@ static int whTest_MultiClientSequential(void)
     /* Expose server contexts to connect callbacks */
     testServer1 = server1;
     testServer2 = server2;
+
+#if !defined(WOLFHSM_CFG_NO_CRYPTO) && defined(WOLFHSM_CFG_SHE_EXTENSION)
+    memset(she1, 0, sizeof(she1));
+    memset(she2, 0, sizeof(she2));
+#endif
 
 #if !defined(WOLFHSM_CFG_NO_CRYPTO)
     /* Initialize wolfCrypt */
@@ -1558,6 +2057,25 @@ static int whTest_MultiClientSequential(void)
     ret = wh_Nvm_Init(nvm, n_conf);
     if (ret != 0)
         return ret;
+
+#ifdef WOLFHSM_CFG_KEYWRAP
+    /* Provision the trusted KEK into the shared NVM before any client runs, the
+     * way whnvmtool would. WH_NVM_FLAGS_TRUSTED makes it the trusted KEK that
+     * unwrap-and-cache requires; both servers freshen it from this NVM. */
+    {
+        whNvmMetadata kekMeta = {0};
+        kekMeta.id     = WH_MAKE_KEYID(WH_KEYTYPE_CRYPTO, WH_KEYUSER_GLOBAL,
+                                       WH_TEST_MC_WRAP_KEK_ID);
+        kekMeta.access = WH_NVM_ACCESS_ANY;
+        kekMeta.flags  = WH_NVM_FLAGS_TRUSTED | WH_NVM_FLAGS_USAGE_WRAP |
+                        WH_NVM_FLAGS_NONEXPORTABLE | WH_NVM_FLAGS_NONMODIFIABLE;
+        kekMeta.len = (whNvmSize)sizeof(whTest_KeywrapKek);
+        memcpy(kekMeta.label, "MC wrap KEK", sizeof("MC wrap KEK"));
+        ret = wh_Nvm_AddObject(nvm, &kekMeta, kekMeta.len, whTest_KeywrapKek);
+        if (ret != 0)
+            return ret;
+    }
+#endif /* WOLFHSM_CFG_KEYWRAP */
 
 #if !defined(WOLFHSM_CFG_NO_CRYPTO)
     /* Initialize RNGs */
@@ -1619,6 +2137,11 @@ static int whTest_MultiClientSequential(void)
         _runGlobalKeysTests(client1, server1, client2, server2));
 #endif
 
+#if defined(WOLFHSM_CFG_SHE_GLOBAL_KEYS) && !defined(WOLFHSM_CFG_NO_CRYPTO)
+    WH_TEST_RETURN_ON_FAIL(
+        _runSheGlobalTests(client1, server1, client2, server2));
+#endif
+
     /* Future test suites here */
 
     /* Cleanup */
@@ -1638,6 +2161,269 @@ static int whTest_MultiClientSequential(void)
     return 0;
 }
 
+#if !defined(WOLFHSM_CFG_NO_CRYPTO) && defined(WOLF_CRYPTO_CB)
+
+/* ============================================================================
+ * CLIENT DEVID REGISTRATION LIFECYCLE
+ *
+ * wh_Client_Init registers the client's devIds in wolfCrypt's process-global,
+ * fixed-size cryptoCb table and wh_Client_Cleanup must unregister them: the
+ * table is only reset when the last wolfCrypt user in the process cleans up,
+ * so a leaked entry both consumes a table slot and keeps dispatching into the
+ * dead client context. Every Init rebinds the global WH_DEV_ID (and
+ * WH_DEV_ID_DMA with DMA) to its own context and additionally registers the
+ * configured devId when it differs from WH_DEV_ID; any client's Cleanup
+ * unregisters the globals. These tests observe table occupancy through the
+ * only public accessors (Register/UnRegister) by counting how many throwaway
+ * registrations fit before the table is full.
+ * ========================================================================== */
+
+/* Throwaway devId base for probing free cryptoCb table slots ("WHT\0"+i).
+ * Outside the global devIds (WH_DEV_ID / WH_DEV_ID_DMA), the custom test
+ * devIds, and the fill range below. */
+#define PROBE_DEV_ID_BASE 0x57485400
+/* Upper bound on probed slots. Must be >= wolfCrypt's
+ * MAX_CRYPTO_DEVID_CALLBACKS (internal to cryptocb.c; default 8). */
+#define PROBE_MAX_SLOTS 128
+
+/* Separate devId base ("WHU\0"+i) for table-fill entries that stay
+ * registered while _countFreeCryptoCbSlots() runs: wolfCrypt re-registration
+ * of an existing devId reuses its entry, so fill ids must never collide with
+ * the probe ids or the count comes back wrong (and the counter's
+ * unregistration pass would tear the fill entries down). */
+#define FILL_DEV_ID_BASE 0x57485500
+
+/* Global devIds rebound by every wh_Client_Init: WH_DEV_ID, plus
+ * WH_DEV_ID_DMA when DMA support is compiled in. Their table slots are
+ * shared by all clients in the process (each Init rebinds the same
+ * entries). */
+#ifdef WOLFHSM_CFG_DMA
+#define GLOBAL_DEVID_COUNT 2
+#else
+#define GLOBAL_DEVID_COUNT 1
+#endif
+
+/* Slots consumed by one wh_Client_Init with a custom (non-default) devId on
+ * an otherwise unoccupied table: the globals plus the configured devId */
+#define DEVIDS_PER_INIT (GLOBAL_DEVID_COUNT + 1)
+
+/* Custom per-client devIds for the two-client cases ("WH"+n). Distinct from
+ * WH_DEV_ID, WH_DEV_ID_DMA, and the probe range. */
+#define TEST_DEVID_1 0x57480001
+#define TEST_DEVID_2 0x57480002
+
+static int _probeCryptoCb(int devId, wc_CryptoInfo* info, void* ctx)
+{
+    (void)devId;
+    (void)info;
+    (void)ctx;
+    return CRYPTOCB_UNAVAILABLE;
+}
+
+/* Count free slots in the cryptoCb table by registering throwaway devIds
+ * until registration fails, then unregistering them all. */
+static int _countFreeCryptoCbSlots(void)
+{
+    int count = 0;
+    int i;
+
+    for (i = 0; i < PROBE_MAX_SLOTS; i++) {
+        if (wc_CryptoCb_RegisterDevice(PROBE_DEV_ID_BASE + i, _probeCryptoCb,
+                                       NULL) != 0) {
+            break;
+        }
+        count++;
+    }
+    for (i = 0; i < count; i++) {
+        wc_CryptoCb_UnRegisterDevice(PROBE_DEV_ID_BASE + i);
+    }
+    return count;
+}
+
+static int whTest_MultiClientDevIdLifecycle(void)
+{
+    int slotsBase = 0;
+    int slots     = 0;
+    int rc        = 0;
+    int i         = 0;
+
+    /* Client transports: no servers needed, registration lifecycle only */
+    static uint8_t       req1[BUFFER_SIZE];
+    static uint8_t       resp1[BUFFER_SIZE];
+    whTransportMemConfig tmcf1[1] = {{
+        .req       = (whTransportMemCsr*)req1,
+        .req_size  = sizeof(req1),
+        .resp      = (whTransportMemCsr*)resp1,
+        .resp_size = sizeof(resp1),
+    }};
+
+    whTransportClientCb         tccb1[1]    = {WH_TRANSPORT_MEM_CLIENT_CB};
+    whTransportMemClientContext tmcc1[1]    = {0};
+    whCommClientConfig          cc_conf1[1] = {{
+                 .transport_cb      = tccb1,
+                 .transport_context = (void*)tmcc1,
+                 .transport_config  = (void*)tmcf1,
+                 .client_id         = WH_TEST_DEFAULT_CLIENT_ID,
+    }};
+    whClientContext             client1[1]  = {0};
+    whClientConfig              c_conf1[1]  = {{
+                      .comm = cc_conf1,
+    }};
+
+    static uint8_t       req2[BUFFER_SIZE];
+    static uint8_t       resp2[BUFFER_SIZE];
+    whTransportMemConfig tmcf2[1] = {{
+        .req       = (whTransportMemCsr*)req2,
+        .req_size  = sizeof(req2),
+        .resp      = (whTransportMemCsr*)resp2,
+        .resp_size = sizeof(resp2),
+    }};
+
+    whTransportClientCb         tccb2[1]    = {WH_TRANSPORT_MEM_CLIENT_CB};
+    whTransportMemClientContext tmcc2[1]    = {0};
+    whCommClientConfig          cc_conf2[1] = {{
+                 .transport_cb      = tccb2,
+                 .transport_context = (void*)tmcc2,
+                 .transport_config  = (void*)tmcf2,
+                 .client_id         = WH_TEST_DEFAULT_CLIENT_ID + 1,
+    }};
+    whClientContext             client2[1]  = {0};
+    whClientConfig              c_conf2[1]  = {{
+                      .comm = cc_conf2,
+    }};
+
+    WH_TEST_PRINT("=== Multi-Client DevId Lifecycle Tests Begin ===\n");
+
+    /* Client ids outside 1..WH_CLIENT_ID_MAX are rejected before any
+     * initialization */
+    cc_conf1[0].client_id = 0;
+    WH_TEST_ASSERT_RETURN(WH_ERROR_BADARGS == wh_Client_Init(client1, c_conf1));
+    cc_conf1[0].client_id = WH_CLIENT_ID_MAX + 1;
+    WH_TEST_ASSERT_RETURN(WH_ERROR_BADARGS == wh_Client_Init(client1, c_conf1));
+    cc_conf1[0].client_id = WH_TEST_DEFAULT_CLIENT_ID;
+
+    /* Negative devIds and (with DMA) the reserved WH_DEV_ID_DMA are
+     * rejected before any initialization */
+    c_conf1[0].devId = -1;
+    WH_TEST_ASSERT_RETURN(WH_ERROR_BADARGS == wh_Client_Init(client1, c_conf1));
+#ifdef WOLFHSM_CFG_DMA
+    c_conf1[0].devId = WH_DEV_ID_DMA;
+    WH_TEST_ASSERT_RETURN(WH_ERROR_BADARGS == wh_Client_Init(client1, c_conf1));
+#endif /* WOLFHSM_CFG_DMA */
+    c_conf1[0].devId = 0;
+
+    /* Hold an app-level wolfCrypt reference for the whole test so the
+     * cryptoCb table is never reset by a final wolfCrypt_Cleanup: any entry
+     * a client leaks stays visible, as it would in a process with other
+     * active wolfCrypt users. */
+    WH_TEST_RETURN_ON_FAIL(wolfCrypt_Init());
+
+    slotsBase = _countFreeCryptoCbSlots();
+    WH_TEST_ASSERT_RETURN(slotsBase >= GLOBAL_DEVID_COUNT + 2);
+
+    /* A config that leaves devId 0 binds the default WH_DEV_ID; only the
+     * global devIds occupy table slots */
+    WH_TEST_RETURN_ON_FAIL(wh_Client_Init(client1, c_conf1));
+    WH_TEST_ASSERT_RETURN(WH_CLIENT_DEVID(client1) == WH_DEV_ID);
+    slots = _countFreeCryptoCbSlots();
+    WH_TEST_ASSERT_RETURN(slots == slotsBase - GLOBAL_DEVID_COUNT);
+
+    /* Cleanup must release every slot Init consumed even though wolfCrypt
+     * stays initialized (the app still holds a reference) */
+    WH_TEST_RETURN_ON_FAIL(wh_Client_Cleanup(client1));
+    slots = _countFreeCryptoCbSlots();
+    WH_TEST_ASSERT_RETURN(slots == slotsBase);
+
+    /* Re-init with the same config must succeed and register again */
+    WH_TEST_RETURN_ON_FAIL(wh_Client_Init(client1, c_conf1));
+    slots = _countFreeCryptoCbSlots();
+    WH_TEST_ASSERT_RETURN(slots == slotsBase - GLOBAL_DEVID_COUNT);
+    WH_TEST_RETURN_ON_FAIL(wh_Client_Cleanup(client1));
+    slots = _countFreeCryptoCbSlots();
+    WH_TEST_ASSERT_RETURN(slots == slotsBase);
+
+    /* A custom configured devId is registered alongside the globals */
+    c_conf1[0].devId = TEST_DEVID_1;
+    WH_TEST_RETURN_ON_FAIL(wh_Client_Init(client1, c_conf1));
+    WH_TEST_ASSERT_RETURN(WH_CLIENT_DEVID(client1) == TEST_DEVID_1);
+    slots = _countFreeCryptoCbSlots();
+    WH_TEST_ASSERT_RETURN(slots == slotsBase - DEVIDS_PER_INIT);
+
+    /* Two simultaneously active clients with distinct devIds: the second
+     * Init rebinds the shared global entries (net zero new slots) and adds
+     * only its own devId */
+    c_conf2[0].devId = TEST_DEVID_2;
+    WH_TEST_RETURN_ON_FAIL(wh_Client_Init(client2, c_conf2));
+    WH_TEST_ASSERT_RETURN(WH_CLIENT_DEVID(client2) == TEST_DEVID_2);
+    slots = _countFreeCryptoCbSlots();
+    WH_TEST_ASSERT_RETURN(slots == slotsBase - DEVIDS_PER_INIT - 1);
+
+    /* Cleaning up one client releases its own devId and the shared global
+     * devIds -- the globals are yanked from the still-active sibling, which
+     * is the documented single-client contract for WH_DEV_ID/WH_DEV_ID_DMA.
+     * The sibling's own configured devId stays registered. */
+    WH_TEST_RETURN_ON_FAIL(wh_Client_Cleanup(client1));
+    slots = _countFreeCryptoCbSlots();
+    WH_TEST_ASSERT_RETURN(slots == slotsBase - 1);
+
+    /* Re-init the first client while the second stays active: the globals
+     * are rebound and both custom devIds are live again */
+    WH_TEST_RETURN_ON_FAIL(wh_Client_Init(client1, c_conf1));
+    slots = _countFreeCryptoCbSlots();
+    WH_TEST_ASSERT_RETURN(slots == slotsBase - DEVIDS_PER_INIT - 1);
+
+    WH_TEST_RETURN_ON_FAIL(wh_Client_Cleanup(client2));
+    slots = _countFreeCryptoCbSlots();
+    WH_TEST_ASSERT_RETURN(slots == slotsBase - 1);
+
+    WH_TEST_RETURN_ON_FAIL(wh_Client_Cleanup(client1));
+    slots = _countFreeCryptoCbSlots();
+    WH_TEST_ASSERT_RETURN(slots == slotsBase);
+    c_conf1[0].devId = 0;
+    c_conf2[0].devId = 0;
+
+    /* Init with a full cryptoCb table must fail cleanly (WH_ERROR_ABORTED)
+     * and the failure-path cleanup must not disturb existing entries */
+    for (i = 0; i < slotsBase; i++) {
+        WH_TEST_RETURN_ON_FAIL(wc_CryptoCb_RegisterDevice(
+            FILL_DEV_ID_BASE + i, _probeCryptoCb, NULL));
+    }
+    rc = wh_Client_Init(client1, c_conf1);
+    WH_TEST_ASSERT_RETURN(rc == WH_ERROR_ABORTED);
+    WH_TEST_ASSERT_RETURN(WH_CLIENT_DEVID(client1) == 0);
+    for (i = 0; i < slotsBase; i++) {
+        wc_CryptoCb_UnRegisterDevice(FILL_DEV_ID_BASE + i);
+    }
+    slots = _countFreeCryptoCbSlots();
+    WH_TEST_ASSERT_RETURN(slots == slotsBase);
+
+    /* Init that fails partway through its registrations (the custom devId
+     * fits, but a later global rebind hits the full table) must unwind
+     * exactly the entries it registered and leave the fill entries intact */
+    for (i = 0; i < slotsBase - (DEVIDS_PER_INIT - 1); i++) {
+        WH_TEST_RETURN_ON_FAIL(wc_CryptoCb_RegisterDevice(
+            FILL_DEV_ID_BASE + i, _probeCryptoCb, NULL));
+    }
+    c_conf1[0].devId = TEST_DEVID_1;
+    rc               = wh_Client_Init(client1, c_conf1);
+    WH_TEST_ASSERT_RETURN(rc == WH_ERROR_ABORTED);
+    slots = _countFreeCryptoCbSlots();
+    WH_TEST_ASSERT_RETURN(slots == DEVIDS_PER_INIT - 1);
+    for (i = 0; i < slotsBase - (DEVIDS_PER_INIT - 1); i++) {
+        wc_CryptoCb_UnRegisterDevice(FILL_DEV_ID_BASE + i);
+    }
+    slots = _countFreeCryptoCbSlots();
+    WH_TEST_ASSERT_RETURN(slots == slotsBase);
+    c_conf1[0].devId = 0;
+
+    (void)wolfCrypt_Cleanup();
+
+    WH_TEST_PRINT("=== Multi-Client DevId Lifecycle Tests Complete ===\n");
+    return 0;
+}
+
+#endif /* !WOLFHSM_CFG_NO_CRYPTO && WOLF_CRYPTO_CB */
+
 /* ============================================================================
  * PUBLIC API
  * ========================================================================== */
@@ -1645,7 +2431,11 @@ static int whTest_MultiClientSequential(void)
 /* Main entry point for multi-client tests */
 int whTest_MultiClient(void)
 {
-    return whTest_MultiClientSequential();
+    WH_TEST_RETURN_ON_FAIL(whTest_MultiClientSequential());
+#if !defined(WOLFHSM_CFG_NO_CRYPTO) && defined(WOLF_CRYPTO_CB)
+    WH_TEST_RETURN_ON_FAIL(whTest_MultiClientDevIdLifecycle());
+#endif
+    return 0;
 }
 
 #endif /* WOLFHSM_CFG_ENABLE_CLIENT && WOLFHSM_CFG_ENABLE_SERVER */

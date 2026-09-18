@@ -6,15 +6,25 @@ name: Build with installed wolfSSL (WOLFSSL_LIB)
 on:
   push:
     branches: [ 'master', 'main', 'release/**' ]
+  schedule:
+    # Weekly ccache reseed; also keeps caches from 7-day eviction
+    - cron: '0 6 * * 1'
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
     branches: [ '*' ]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
 
 jobs:
   build:
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.draft == false }}
     runs-on: ubuntu-latest
+    timeout-minutes: 10
 
     steps:
     - uses: actions/checkout@v4
@@ -24,6 +34,13 @@ jobs:
       with:
         repository: wolfssl/wolfssl
         path: wolfssl
+
+    # Compiler cache; PR runs restore without saving
+    - name: Set up ccache
+      uses: ./.github/actions/ccache-setup
+      with:
+        workflow-id: build-and-test-wolfssl-lib
+        read-only: ${{ github.event_name == 'pull_request' }}
 
     - name: Build and install wolfssl
       # HAVE_ANONYMOUS_INLINE_AGGREGATES toggles the layout of wc_CryptoInfo

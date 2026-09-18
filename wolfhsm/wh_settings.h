@@ -40,12 +40,39 @@
  *  keys to be shared across multiple clients
  *      Default: Not defined
  *
+ *  WOLFHSM_CFG_SHE_GLOBAL_KEYS - If defined, all AutoSAR SHE key slots live in
+ *  the global-keys namespace instead of being scoped per client, so every
+ *  client shares a single SHE device view. Requires WOLFHSM_CFG_GLOBAL_KEYS
+ *  and WOLFHSM_CFG_SHE_EXTENSION.
+ *      Default: Not defined
+ *
+ *  WOLFHSM_CFG_CRYPTO_AFFINITY - If defined, enable per-client crypto affinity,
+ *  allowing a client to request that crypto operations run on the server's
+ *  hardware device (WH_CRYPTO_AFFINITY_HW) or in software
+ *  (WH_CRYPTO_AFFINITY_SW). When not defined, the server always uses its
+ *  configured devId and the affinity request header field is ignored.
+ *      Default: Not defined
+ *
  *  WOLFHSM_CFG_KEYWRAP - If defined, include the key wrap functionality
  *      Default: Not defined
  *
  *  WOLFHSM_CFG_KEYWRAP_MAX_KEY_SIZE - The maximum size (in bytes) of a key that
- *  can be wrapped
- *      Default: 512
+ *  can be wrapped. Together with the request header it must fit within
+ *  WOLFHSM_CFG_COMM_DATA_LEN, which is checked at compile time
+ *      Default: 2000, or what WOLFHSM_CFG_COMM_DATA_LEN leaves when smaller
+ *
+ *  WOLFHSM_CFG_KEYWRAP_MAX_DATA_SIZE - The maximum size (in bytes) of a data
+ *  payload that can be wrapped, bounded by WOLFHSM_CFG_COMM_DATA_LEN the same
+ *  way as WOLFHSM_CFG_KEYWRAP_MAX_KEY_SIZE
+ *      Default: 2000, or what WOLFHSM_CFG_COMM_DATA_LEN leaves when smaller
+ *
+ *  WOLFHSM_CFG_HWKEYSTORE - If defined, include the hardware keystore
+ *  front-end module and hardware-only key (WH_KEYTYPE_HW) support
+ *      Default: Not defined
+ *
+ *  WOLFHSM_CFG_HWKEYSTORE_MAX_KEY_SIZE - The maximum size (in bytes) of a key
+ *  served by a hardware keystore backend
+ *      Default: 32
  *
  *  WOLFHSM_CFG_HEXDUMP - If defined, include wh_Utils_HexDump functionality
  *                          using stdio.h
@@ -60,14 +87,37 @@
  *  WOLFHSM_CFG_ENABLE_TIMEOUT - If defined, include client-side support for
  *  blocking request timeouts
  *
+ *  WOLFHSM_CFG_ENABLE_AUTHENTICATION - EXPERIMENTAL. If defined, include the
+ *  Auth Manager (wh_auth*), which adds per-client user authentication and
+ *  per-user authorization to the server. Clients log in with a credential
+ *  (PIN or certificate) to establish a session, and the server checks the
+ *  resulting per-user permissions (per message group/action, plus key ID
+ *  access) before dispatching a request. Checks are only applied if the
+ *  server is configured with an auth context; without one all requests are
+ *  processed unchecked. The API and wire format are subject to change and
+ *  are not covered by compatibility guarantees.
+ *      Default: Not defined
+ *
  *  WOLFHSM_CFG_NVM_OBJECT_COUNT - Number of objects in ram and disk directories
  *      Default: 32
+ *
+ *  WOLFHSM_CFG_NVM_FLASH_CRC16 - If defined, the nvm_flash backend stores a
+ *  CRC16 of each object's metadata and data in the on-flash object state and
+ *  verifies them: metadata when the directory is loaded, data on full-object
+ *  reads and reclaim copies. Changes the on-flash format: images written with
+ *  and without this option are mutually incompatible, and whnvmtool must be
+ *  built with the same setting as the server.
+ *      Default: Not defined
  *
  *  WOLFHSM_CFG_SERVER_KEYCACHE_COUNT - Number of RAM keys
  *      Default: 8
  *
  *  WOLFHSM_CFG_SERVER_KEYCACHE_BUFSIZE - Size of each key in RAM
  *      Default: 1200
+ *
+ *  WOLFHSM_CFG_SERVER_KDF_MAX_KEY_SIZE - Largest cached key usable as a KDF
+ *      input (HKDF IKM, CMAC-KDF Z)
+ *      Default: 256
  *
  *  WOLFHSM_CFG_SERVER_CUSTOMCB_COUNT - Number of additional callbacks
  *      Default: 8
@@ -169,7 +219,13 @@
 
 #include <stdint.h>
 
-#ifndef WOLFHSM_CFG_NO_CRYPTO
+/* WH_PADDING_CHECK is an internal sentinel set only by the wire-format
+ * struct-padding audit (test/wh_test_check_struct_padding.c). It suppresses
+ * external dependencies (wolfSSL headers, etc.) so that audit can compile
+ * without dragging in third-party source whose layout could perturb -Wpadded.
+ * It is NOT a public configuration flag — do not use it from application
+ * code. */
+#if !defined(WOLFHSM_CFG_NO_CRYPTO) && !defined(WH_PADDING_CHECK)
 #ifdef WOLFSSL_USER_SETTINGS
 #include "user_settings.h"
 #else
@@ -181,7 +237,7 @@
 #if defined(WOLFHSM_CFG_DEBUG) || defined(WOLFHSM_CFG_DEBUG_VERBOSE)
 #define WOLFHSM_CFG_HEXDUMP
 #endif
-#endif /* !WOLFHSM_CFG_NO_CRYPTO */
+#endif /* !WOLFHSM_CFG_NO_CRYPTO && !WH_PADDING_CHECK */
 
 /* Platform system time access */
 #if !defined WOLFHSM_CFG_NO_SYS_TIME && !defined(WOLFHSM_CFG_PORT_GETTIME)
@@ -201,6 +257,37 @@
 #define WOLFHSM_CFG_COMM_DATA_LEN 1280
 #endif
 
+/* Maximum keywrap key and data sizes, defaulted to fit the comm data buffer
+ * after the largest request header (asserted in the message header) */
+#if defined(WOLFHSM_CFG_KEYWRAP)
+
+/* Widest header is 38 bytes, rounded up to the next 8-byte boundary */
+#define WH_KEYWRAP_MAX_REQ_OVERHEAD 40
+
+#if WOLFHSM_CFG_COMM_DATA_LEN <= WH_KEYWRAP_MAX_REQ_OVERHEAD
+#error "WOLFHSM_CFG_COMM_DATA_LEN is too small to carry a keywrap request"
+#endif
+
+#ifndef WOLFHSM_CFG_KEYWRAP_MAX_KEY_SIZE
+#if (WOLFHSM_CFG_COMM_DATA_LEN - WH_KEYWRAP_MAX_REQ_OVERHEAD) < 2000
+#define WOLFHSM_CFG_KEYWRAP_MAX_KEY_SIZE \
+    (WOLFHSM_CFG_COMM_DATA_LEN - WH_KEYWRAP_MAX_REQ_OVERHEAD)
+#else
+#define WOLFHSM_CFG_KEYWRAP_MAX_KEY_SIZE 2000
+#endif
+#endif
+
+#ifndef WOLFHSM_CFG_KEYWRAP_MAX_DATA_SIZE
+#if (WOLFHSM_CFG_COMM_DATA_LEN - WH_KEYWRAP_MAX_REQ_OVERHEAD) < 2000
+#define WOLFHSM_CFG_KEYWRAP_MAX_DATA_SIZE \
+    (WOLFHSM_CFG_COMM_DATA_LEN - WH_KEYWRAP_MAX_REQ_OVERHEAD)
+#else
+#define WOLFHSM_CFG_KEYWRAP_MAX_DATA_SIZE 2000
+#endif
+#endif
+
+#endif /* WOLFHSM_CFG_KEYWRAP */
+
 /** Default server resource configurations */
 /* Reported version string */
 #ifndef WOLFHSM_CFG_INFOVERSION
@@ -219,12 +306,17 @@
 
 /* Number of RAM keys */
 #ifndef WOLFHSM_CFG_SERVER_KEYCACHE_COUNT
+#if defined(WOLFHSM_CFG_SHE_EXTENSION)
+/* Default to large enough cache to hold all SHE keys */
+#define WOLFHSM_CFG_SERVER_KEYCACHE_COUNT 16
+#else
 #define WOLFHSM_CFG_SERVER_KEYCACHE_COUNT  8
+#endif
 #endif
 
 /* Number of big RAM keys */
 #ifndef WOLFHSM_CFG_SERVER_KEYCACHE_BIG_COUNT
-#define WOLFHSM_CFG_SERVER_KEYCACHE_BIG_COUNT  1
+#define WOLFHSM_CFG_SERVER_KEYCACHE_BIG_COUNT 3
 #endif
 
 /* Size in bytes of each key cache buffer  */
@@ -234,7 +326,13 @@
 
 /* Size in bytes of each big key cache buffer  */
 #ifndef WOLFHSM_CFG_SERVER_KEYCACHE_BIG_BUFSIZE
+#if defined(WOLFSSL_HAVE_MLDSA) || defined(WOLFSSL_HAVE_XMSS) || \
+    defined(WOLFSSL_HAVE_LMS) || defined(WOLFSSL_HAVE_MLKEM)
+#define WOLFHSM_CFG_SERVER_KEYCACHE_BIG_BUFSIZE 8192
+#else
+/* Sane default to hold ASN.1 RSA 4096 public+private key */
 #define WOLFHSM_CFG_SERVER_KEYCACHE_BIG_BUFSIZE 1200
+#endif
 #endif
 
 /* Custom request shared defs */
@@ -388,7 +486,9 @@
 #endif
 
 /** Configuration checks */
-#ifndef WOLFHSM_CFG_NO_CRYPTO
+/* Skipped under WH_PADDING_CHECK because the wolfSSL feature macros
+ * referenced below are only defined when wolfssl/options.h is pulled. */
+#if !defined(WOLFHSM_CFG_NO_CRYPTO) && !defined(WH_PADDING_CHECK)
 /* Crypto Cb is mandatory */
 #ifndef WOLF_CRYPTO_CB
 #error "wolfHSM requires wolfCrypt built with WOLF_CRYPTO_CB"
@@ -406,6 +506,20 @@
 #error "wolfHSM requires wolfCrypt built without NO_RNG"
 #endif
 
+/* Client response parsing calls wc_ecc_import_* on devId-bound keys (e.g.
+ * wh_Crypto_EccUpdatePrivateOnlyKeyDer from wh_Client_EccVerifyResponse)
+ * while the response still sits in the client's comm packet buffer. With
+ * WOLFSSL_VALIDATE_ECC_IMPORT those imports re-enter the crypto callback and
+ * run a nested HSM transaction that reuses that buffer. The wire protocol
+ * tolerates nesting (transactions are strictly sequential), but correctness
+ * would rest on every response parser having copied out all data it needs
+ * before any import — an invariant that is not enforced or audited. Server
+ * builds are unaffected: their import validation dispatches to the server's
+ * local crypto provider, not the transport. */
+#if defined(WOLFHSM_CFG_ENABLE_CLIENT) && defined(WOLFSSL_VALIDATE_ECC_IMPORT)
+#error "WOLFSSL_VALIDATE_ECC_IMPORT is not supported in wolfHSM client builds"
+#endif
+
 #if defined(WOLFHSM_CFG_SHE_EXTENSION)
 #if defined(NO_AES) || \
     !defined(WOLFSSL_CMAC) || \
@@ -417,20 +531,21 @@
 
 #if defined(WOLFHSM_CFG_KEYWRAP)
 
-#ifndef WOLFHSM_CFG_KEYWRAP_MAX_KEY_SIZE
-#define WOLFHSM_CFG_KEYWRAP_MAX_KEY_SIZE 2000
-#endif
-
-#ifndef WOLFHSM_CFG_KEYWRAP_MAX_DATA_SIZE
-#define WOLFHSM_CFG_KEYWRAP_MAX_DATA_SIZE 2000
-#endif
-
 #if defined(NO_AES) || !defined(HAVE_AESGCM)
 #error \
     "WOLFHSM_CFG_KEYWRAP requires NO_AES to be undefined and HAVE_AESGCM to be defined"
 #endif
 
 #endif /* WOLFHSM_CFG_KEYWRAP */
+
+#if defined(HAVE_HKDF) || defined(HAVE_CMAC_KDF)
+
+/* Largest cached key the server accepts as a KDF input supplied by key ID */
+#ifndef WOLFHSM_CFG_SERVER_KDF_MAX_KEY_SIZE
+#define WOLFHSM_CFG_SERVER_KDF_MAX_KEY_SIZE 256
+#endif
+
+#endif /* HAVE_HKDF || HAVE_CMAC_KDF */
 
 #if defined(WOLFHSM_CFG_CERTIFICATE_MANAGER_ACERT)
 #if !defined(WOLFSSL_ACERT) || !defined(WOLFSSL_ASN_TEMPLATE)
@@ -439,28 +554,78 @@
 #endif /* !WOLFSSL_ACERT || !WOLFSSL_ASN_TEMPLATE */
 #endif /* WOLFHSM_CFG_CERTIFICATE_MANAGER_ACERT */
 
-#endif /* !WOLFHSM_CFG_NO_CRYPTO */
+#endif /* !WOLFHSM_CFG_NO_CRYPTO && !WH_PADDING_CHECK */
 
 #if defined(WOLFHSM_CFG_NO_CRYPTO) && defined(WOLFHSM_CFG_KEYWRAP)
 #error "WOLFHSM_CFG_KEYWRAP is incompatible with WOLFHSM_CFG_NO_CRYPTO"
 #endif
 
+/* Crypto affinity selects the devId used for crypto operations, so it has no
+ * meaning without wolfCrypt. */
+#if defined(WOLFHSM_CFG_NO_CRYPTO) && defined(WOLFHSM_CFG_CRYPTO_AFFINITY)
+#error "WOLFHSM_CFG_CRYPTO_AFFINITY is incompatible with WOLFHSM_CFG_NO_CRYPTO"
+#endif
+
+#if defined(WOLFHSM_CFG_HWKEYSTORE)
+#ifndef WOLFHSM_CFG_HWKEYSTORE_MAX_KEY_SIZE
+#define WOLFHSM_CFG_HWKEYSTORE_MAX_KEY_SIZE 32
+#endif
+#endif /* WOLFHSM_CFG_HWKEYSTORE */
+
+/* Trusted cert verify cache requires the certificate manager and crypto.
+ * Enforce here so downstream code can gate on
+ * WOLFHSM_CFG_CERTIFICATE_VERIFY_CACHE alone instead of repeating the full
+ * dependency chain at every site. */
+#if defined(WOLFHSM_CFG_CERTIFICATE_VERIFY_CACHE) && \
+    !defined(WOLFHSM_CFG_CERTIFICATE_MANAGER)
+#error \
+    "WOLFHSM_CFG_CERTIFICATE_VERIFY_CACHE requires WOLFHSM_CFG_CERTIFICATE_MANAGER"
+#endif
+
+#if defined(WOLFHSM_CFG_CERTIFICATE_VERIFY_CACHE) && \
+    defined(WOLFHSM_CFG_NO_CRYPTO)
+#error \
+    "WOLFHSM_CFG_CERTIFICATE_VERIFY_CACHE is incompatible with WOLFHSM_CFG_NO_CRYPTO"
+#endif
+
+/* The global cross-client verify cache is a layered option on top of the
+ * per-client cache. Enforce the dependency so downstream code can gate on
+ * WOLFHSM_CFG_CERTIFICATE_VERIFY_CACHE_GLOBAL alone. */
+#if defined(WOLFHSM_CFG_CERTIFICATE_VERIFY_CACHE_GLOBAL) && \
+    !defined(WOLFHSM_CFG_CERTIFICATE_VERIFY_CACHE)
+#error \
+    "WOLFHSM_CFG_CERTIFICATE_VERIFY_CACHE_GLOBAL requires WOLFHSM_CFG_CERTIFICATE_VERIFY_CACHE"
+#endif
+
+/* Enforce both dependencies so downstream code can gate on
+ * WOLFHSM_CFG_SHE_GLOBAL_KEYS alone. */
+#if defined(WOLFHSM_CFG_SHE_GLOBAL_KEYS) && !defined(WOLFHSM_CFG_SHE_EXTENSION)
+#error "WOLFHSM_CFG_SHE_GLOBAL_KEYS requires WOLFHSM_CFG_SHE_EXTENSION"
+#endif
+
+#if defined(WOLFHSM_CFG_SHE_GLOBAL_KEYS) && !defined(WOLFHSM_CFG_GLOBAL_KEYS)
+#error "WOLFHSM_CFG_SHE_GLOBAL_KEYS requires WOLFHSM_CFG_GLOBAL_KEYS"
+#endif
+
 /** Cache flushing and memory fencing synchronization primitives */
 /* Create a full sequential memory fence to ensure compiler memory ordering */
 #ifndef XMEMFENCE
- #ifndef WOLFHSM_CFG_NO_CRYPTO
-  #include "wolfssl/wolfcrypt/wc_port.h"
-  #define XMEMFENCE() XFENCE()
- #else
-  #if defined(__STDC_VERSION__) && (__STDC_VERSION__ >= 201112L) && !defined(__STDC_NO_ATOMICS__)
-   #include <stdatomic.h>
-   #define XMEMFENCE() atomic_thread_fence(memory_order_seq_cst)
-  #elif defined(__GNUC__) || defined(__clang__)
-   #define XMEMFENCE() __atomic_thread_fence(__ATOMIC_SEQ_CST)
-  #else
-   /* PPC32: __asm__ volatile ("sync" : : : "memory") */
-   #define XMEMFENCE() do { } while (0)
-   #warning "wolfHSM memory transports should have a functional XMEMFENCE"
+#if !defined(WOLFHSM_CFG_NO_CRYPTO) && !defined(WH_PADDING_CHECK)
+#include "wolfssl/wolfcrypt/wc_port.h"
+#define XMEMFENCE() XFENCE()
+#else
+#if defined(__STDC_VERSION__) && (__STDC_VERSION__ >= 201112L) && \
+    !defined(__STDC_NO_ATOMICS__)
+#include <stdatomic.h>
+#define XMEMFENCE() atomic_thread_fence(memory_order_seq_cst)
+#elif defined(__GNUC__) || defined(__clang__)
+#define XMEMFENCE() __atomic_thread_fence(__ATOMIC_SEQ_CST)
+#else
+/* PPC32: __asm__ volatile ("sync" : : : "memory") */
+#define XMEMFENCE() \
+    do {            \
+    } while (0)
+#warning "wolfHSM memory transports should have a functional XMEMFENCE"
   #endif
  #endif
 #endif

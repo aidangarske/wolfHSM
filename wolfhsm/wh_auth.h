@@ -189,12 +189,13 @@ typedef struct {
                               whUserId user_id, whAuthPermissions permissions);
 
     /* Get user information by username */
-    int (*UserGet)(void* context, const char* username, whUserId* out_user_id,
+    int (*UserGet)(void* context, whUserId current_user_id,
+                   const char* username, whUserId* out_user_id,
                    whAuthPermissions* out_permissions);
 
     /* Set user credentials (PIN, etc.) */
-    int (*UserSetCredentials)(void* context, whUserId user_id,
-                              whAuthMethod method,
+    int (*UserSetCredentials)(void* context, whUserId current_user_id,
+                              whUserId user_id, whAuthMethod method,
                               const void*  current_credentials,
                               uint16_t     current_credentials_len,
                               const void*  new_credentials,
@@ -272,6 +273,20 @@ int wh_Auth_Login(whAuthContext* context, uint8_t client_id,
 int wh_Auth_Logout(whAuthContext* context, whUserId user_id);
 
 /**
+ * @brief Force-clear the local session state, dropping any logged-in user.
+ *
+ * Zeroes only the session (user) state under the auth lock, leaving the
+ * externally-owned configuration (callbacks, context, lock) intact. Does not
+ * invoke the backend logout callback. If the lock can not be acquired the
+ * session is left unchanged and the lock error is returned.
+ *
+ * @param[in] context Pointer to the auth context.
+ * @return int WH_ERROR_OK on success, WH_ERROR_BADARGS for a NULL context, or
+ *         the lock error if the lock could not be acquired.
+ */
+int wh_Auth_Reset(whAuthContext* context);
+
+/**
  * @brief Check authorization for an action.
  *
  * @param[in] context Pointer to the auth context.
@@ -324,6 +339,9 @@ int wh_Auth_UserDelete(whAuthContext* context, whUserId user_id);
 /**
  * @brief Set user permissions.
  *
+ * On success, a change targeting this context's logged-in user also refreshes
+ * its cached session permissions, so it binds immediately.
+ *
  * @param[in] context Pointer to the auth context.
  * @param[in] user_id The user ID to set permissions for.
  * @param[in] permissions The new permissions to set.
@@ -334,6 +352,9 @@ int wh_Auth_UserSetPermissions(whAuthContext* context, whUserId user_id,
 
 /**
  * @brief Get user information.
+ *
+ * The caller's own user id gates access: a non-admin caller may only read its
+ * own record, and a denied or missing lookup both return WH_ERROR_ACCESS.
  *
  * @param[in] context Pointer to the auth context.
  * @param[in] username The username to look up.

@@ -1,3 +1,69 @@
+# wolfHSM Release v1.5.0 (August 21, 2026)
+
+Due to NDA restrictions, access to the Infineon, ST Micro, TI, and Renesas ports is limited. Please contact [support@wolfssl.com](mailto:support@wolfssl.com) for access.
+
+## New Feature Additions
+* Added non-blocking request/response client APIs for SHA, RNG, AES, RSA, ECC, and CMAC operations in https://github.com/wolfSSL/wolfHSM/pull/337, https://github.com/wolfSSL/wolfHSM/pull/344, https://github.com/wolfSSL/wolfHSM/pull/347, https://github.com/wolfSSL/wolfHSM/pull/351, https://github.com/wolfSSL/wolfHSM/pull/368, and https://github.com/wolfSSL/wolfHSM/pull/381
+* Added ML-KEM (FIPS 203) support for key generation, encapsulation, and decapsulation with DMA variants in https://github.com/wolfSSL/wolfHSM/pull/336
+* Added LMS and XMSS stateful hash-based signature support in https://github.com/wolfSSL/wolfHSM/pull/352
+* Added SHA-3 support with blocking wolfCrypt and non-blocking native APIs in https://github.com/wolfSSL/wolfHSM/pull/384
+* Added DMA support for AES-ECB, AES-CBC, and AES-CTR and reworked AES-GCM DMA handling in https://github.com/wolfSSL/wolfHSM/pull/282
+* Added authentication manager with user login, per-user permissions, and NVM-backed credential storage in https://github.com/wolfSSL/wolfHSM/pull/270, https://github.com/wolfSSL/wolfHSM/pull/290, https://github.com/wolfSSL/wolfHSM/pull/382, and https://github.com/wolfSSL/wolfHSM/pull/386
+* Added client response timeout support with optional expiration callback in https://github.com/wolfSSL/wolfHSM/pull/278
+* Added STM32H5 TrustZone port with non-secure callable bridge transport in https://github.com/wolfSSL/wolfHSM/pull/348
+* Added per-client wolfCrypt device IDs enabling multiple clients in a single process in https://github.com/wolfSSL/wolfHSM/pull/406
+* Added client API to select hardware or software crypto processing at runtime in https://github.com/wolfSSL/wolfHSM/pull/281
+* Added hardware-only key support allowing server operations to reference keys held in hardware in https://github.com/wolfSSL/wolfHSM/pull/409
+* Added public key export for cached asymmetric keys, including returning the public key from cached key generation in https://github.com/wolfSSL/wolfHSM/pull/346 and https://github.com/wolfSSL/wolfHSM/pull/458
+* Added cache-only shared secrets keeping ECDH and X25519 outputs server-resident in https://github.com/wolfSSL/wolfHSM/pull/372
+* Added client API to generate and cache a random key on the server in https://github.com/wolfSSL/wolfHSM/pull/437
+* Added multi-root CA certificate chain verification in https://github.com/wolfSSL/wolfHSM/pull/350
+* Added trusted certificate cache and certificate verification callbacks in https://github.com/wolfSSL/wolfHSM/pull/353
+* Added wolfBoot image verification to the image manager in https://github.com/wolfSSL/wolfHSM/pull/339
+* Added global SHE key support enabling SHE key slots to be shared across all clients in https://github.com/wolfSSL/wolfHSM/pull/478
+* Added SHE GET_ID command and key wrap interoperability with SHE keys in https://github.com/wolfSSL/wolfHSM/pull/450 and https://github.com/wolfSSL/wolfHSM/pull/413
+* Added support for running the server without NVM using the key cache only in https://github.com/wolfSSL/wolfHSM/pull/392
+* Added CRC integrity checking to the NVM flash backend in https://github.com/wolfSSL/wolfHSM/pull/503
+* Added support for dynamically linking libwolfssl in https://github.com/wolfSSL/wolfHSM/pull/349
+
+## Bug Fixes
+* Bounded peer-controlled lengths in client and server transport receive paths in https://github.com/wolfSSL/wolfHSM/pull/388, https://github.com/wolfSSL/wolfHSM/pull/389, and https://github.com/wolfSSL/wolfHSM/pull/410
+* Validated server-reported lengths and payload sizes in client crypto response handlers in https://github.com/wolfSSL/wolfHSM/pull/361, https://github.com/wolfSSL/wolfHSM/pull/366, https://github.com/wolfSSL/wolfHSM/pull/367, https://github.com/wolfSSL/wolfHSM/pull/373, https://github.com/wolfSSL/wolfHSM/pull/374, https://github.com/wolfSSL/wolfHSM/pull/375, https://github.com/wolfSSL/wolfHSM/pull/376, https://github.com/wolfSSL/wolfHSM/pull/463, https://github.com/wolfSSL/wolfHSM/pull/465, https://github.com/wolfSSL/wolfHSM/pull/467, https://github.com/wolfSSL/wolfHSM/pull/473, and https://github.com/wolfSSL/wolfHSM/pull/474
+* Bounded AES, LMS, XMSS, and ML-KEM DMA response frames in the crypto client in https://github.com/wolfSSL/wolfHSM/pull/475 and https://github.com/wolfSSL/wolfHSM/pull/476
+* Added request and response size validation to server request handlers, keystore, and crypto request translation in https://github.com/wolfSSL/wolfHSM/pull/299, https://github.com/wolfSSL/wolfHSM/pull/302, and https://github.com/wolfSSL/wolfHSM/pull/466
+* Fixed key wrap request and response bounds, metadata trailer translation, and a data unwrap bug in https://github.com/wolfSSL/wolfHSM/pull/323, https://github.com/wolfSSL/wolfHSM/pull/359, https://github.com/wolfSSL/wolfHSM/pull/472, https://github.com/wolfSSL/wolfHSM/pull/494, and https://github.com/wolfSSL/wolfHSM/pull/510
+* Added bounds checks to SHE client requests and responses and bounded SHE server key loads in https://github.com/wolfSSL/wolfHSM/pull/334, https://github.com/wolfSSL/wolfHSM/pull/457, and https://github.com/wolfSSL/wolfHSM/pull/495
+* Fixed certificate handlers to validate inputs, check response lengths, capture verification results, and stop transmitting unwritten response bytes in https://github.com/wolfSSL/wolfHSM/pull/317, https://github.com/wolfSSL/wolfHSM/pull/365, https://github.com/wolfSSL/wolfHSM/pull/390, https://github.com/wolfSSL/wolfHSM/pull/426, and https://github.com/wolfSSL/wolfHSM/pull/459
+* Fixed certificate verify message padding differences between clients and servers with different ABIs in https://github.com/wolfSSL/wolfHSM/pull/507
+* Fixed client DMA address translation and a use-after-free in key, NVM, and certificate DMA operations in https://github.com/wolfSSL/wolfHSM/pull/403 and https://github.com/wolfSSL/wolfHSM/pull/408
+* Fixed integer overflow in the DMA allow list boundary check, improved server DMA validation, and ensured DMA post-operation callbacks run on error paths in https://github.com/wolfSSL/wolfHSM/pull/298, https://github.com/wolfSSL/wolfHSM/pull/329, https://github.com/wolfSSL/wolfHSM/pull/324, and https://github.com/wolfSSL/wolfHSM/pull/340
+* Fixed integer underflow in AES-GCM unwrap size calculations, missing AES context free on set-key failure, and AES-CTR bounds checking in https://github.com/wolfSSL/wolfHSM/pull/296, https://github.com/wolfSSL/wolfHSM/pull/306, https://github.com/wolfSSL/wolfHSM/pull/307, and https://github.com/wolfSSL/wolfHSM/pull/379
+* Fixed overflow-prone bounds checks in NVM read handlers and 32-bit size_t overflow in AES and SHE size checks in https://github.com/wolfSSL/wolfHSM/pull/319 and https://github.com/wolfSSL/wolfHSM/pull/487
+* Fixed SHE server secure boot chunk sizing, master ECU key metadata, constant-time comparison, and stack buffer zeroization in https://github.com/wolfSSL/wolfHSM/pull/293, https://github.com/wolfSSL/wolfHSM/pull/294, https://github.com/wolfSSL/wolfHSM/pull/310, https://github.com/wolfSSL/wolfHSM/pull/325, https://github.com/wolfSSL/wolfHSM/pull/326, and https://github.com/wolfSSL/wolfHSM/pull/332
+* Fixed metadata label leak in key export error responses and stripped server-only flags from client metadata when caching random keys in https://github.com/wolfSSL/wolfHSM/pull/316 and https://github.com/wolfSSL/wolfHSM/pull/496
+* Fixed NVM destroy batches aborting on absent IDs, NULL metadata handling in the checked add path, and committed state for keys read back from NVM in https://github.com/wolfSSL/wolfHSM/pull/461, https://github.com/wolfSSL/wolfHSM/pull/462, and https://github.com/wolfSSL/wolfHSM/pull/401
+* Improved NVM locking across the crypto layer to prevent races on shared key caches in https://github.com/wolfSSL/wolfHSM/pull/438
+* Fixed authentication manager to log out users on disconnect, enforce caller identity, refresh stale session permissions, and zeroize request messages in https://github.com/wolfSSL/wolfHSM/pull/383, https://github.com/wolfSSL/wolfHSM/pull/480, https://github.com/wolfSSL/wolfHSM/pull/481, and https://github.com/wolfSSL/wolfHSM/pull/432
+* Guarded against clients connecting with aliased client IDs in https://github.com/wolfSSL/wolfHSM/pull/362
+* Fixed SHA client response struct initialization, block-transfer error propagation, and SHA-512 finalize error overwrite in https://github.com/wolfSSL/wolfHSM/pull/308, https://github.com/wolfSSL/wolfHSM/pull/309, and https://github.com/wolfSSL/wolfHSM/pull/311
+* Restored SHA-3 client state when the server cannot offload the operation in https://github.com/wolfSSL/wolfHSM/pull/455
+* Fixed ML-DSA cache import buffer sizing, verify-only cache size checks, and compatibility with updated wolfCrypt APIs in https://github.com/wolfSSL/wolfHSM/pull/397, https://github.com/wolfSSL/wolfHSM/pull/452, and https://github.com/wolfSSL/wolfHSM/pull/301
+* Fixed config path copy bounds, shared memory create TOCTOU, VERIFY_ACERT DMA error propagation, and KDF and AES-GCM response output bounds in https://github.com/wolfSSL/wolfHSM/pull/425
+* Improved POSIX transport file permissions and descriptor handling, bounded shared memory mapping by the shared object size, and required peer certificates for TLS transport server mode in https://github.com/wolfSSL/wolfHSM/pull/322, https://github.com/wolfSSL/wolfHSM/pull/479, and https://github.com/wolfSSL/wolfHSM/pull/363
+* Fixed off-by-one in constant-time zero compare, uint16 truncation, void pointer arithmetic, and transposed arguments in flash unit reads in https://github.com/wolfSSL/wolfHSM/pull/304, https://github.com/wolfSSL/wolfHSM/pull/314, https://github.com/wolfSSL/wolfHSM/pull/431, and https://github.com/wolfSSL/wolfHSM/pull/295
+
+## Enhancements and Optimizations
+* Overhauled the documentation and added user management invariants in https://github.com/wolfSSL/wolfHSM/pull/387 and https://github.com/wolfSSL/wolfHSM/pull/405
+* Added CONTRIBUTING.md covering the contributor agreement and PR process in https://github.com/wolfSSL/wolfHSM/pull/509
+* Added LMS, XMSS, ML-DSA, SHA-3, and HMAC-SHA3 benchmark modules and single round-trip ML-KEM timing in https://github.com/wolfSSL/wolfHSM/pull/454, https://github.com/wolfSSL/wolfHSM/pull/488, https://github.com/wolfSSL/wolfHSM/pull/499, https://github.com/wolfSSL/wolfHSM/pull/501, and https://github.com/wolfSSL/wolfHSM/pull/504
+* Fixed SHA-2 benchmarks being skipped in non-DMA builds and reduced benchmark memory usage in https://github.com/wolfSSL/wolfHSM/pull/497, https://github.com/wolfSSL/wolfHSM/pull/456, and https://github.com/wolfSSL/wolfHSM/pull/514
+* Reduced CI runtime with concurrency limits, ccache, draft PR filtering, and reorganized workflow matrices in https://github.com/wolfSSL/wolfHSM/pull/482, https://github.com/wolfSSL/wolfHSM/pull/483, https://github.com/wolfSSL/wolfHSM/pull/484, https://github.com/wolfSSL/wolfHSM/pull/485, and https://github.com/wolfSSL/wolfHSM/pull/489
+* Added 32-bit CI job and automated coverage comparison in https://github.com/wolfSSL/wolfHSM/pull/491 and https://github.com/wolfSSL/wolfHSM/pull/490
+* Migrated to the wc_MlDsaKey wolfCrypt API removing legacy Dilithium naming in https://github.com/wolfSSL/wolfHSM/pull/377
+* Added ECC_MAKE_PUB and ECC_CHECK_PUB crypto callback support in https://github.com/wolfSSL/wolfHSM/pull/451
+* Increased default key cache sizes for SHE, RSA, and ML-DSA use cases in https://github.com/wolfSSL/wolfHSM/pull/400 and https://github.com/wolfSSL/wolfHSM/pull/402
+* Added test coverage for SHE loadable keys and secure boot, key usage policies, wrapped key restrictions, permission escalation, and DMA allow list boundaries in https://github.com/wolfSSL/wolfHSM/pull/335, https://github.com/wolfSSL/wolfHSM/pull/430, https://github.com/wolfSSL/wolfHSM/pull/380, https://github.com/wolfSSL/wolfHSM/pull/424, https://github.com/wolfSSL/wolfHSM/pull/470, and https://github.com/wolfSSL/wolfHSM/pull/500
+
 # wolfHSM Release v1.4.0 (February 16, 2026)
 
 Due to NDA restrictions, access to the Infineon, ST Micro, TI, and Renesas ports is limited. Please contact [support@wolfssl.com](mailto:support@wolfssl.com) for access.

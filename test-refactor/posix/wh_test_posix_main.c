@@ -47,6 +47,8 @@
 
 #include "wh_test_posix_client.h"
 #include "wh_test_posix_server.h"
+#include "wh_test_keygen_unique_id.h"
+#include "wh_test_keyread_race.h"
 
 /* POSIX-only thread-safety stress test. Called directly rather
  * than through the suite runner: the legacy test owns its own
@@ -64,13 +66,28 @@
  * RAM-based flash simulator, which is a host-sim component;
  * the nvm_flash test wires the NVM stack to that simulator
  * with a 1 MB buffer that's not realistic on embedded targets.
- * Both run from the POSIX port directly until the NVM test is
- * reworked to take a port-supplied flash fixture (then it can
+ * The recovery test layers a fault-injection wrapper over the
+ * same simulator to abort a write mid-object and check cleanup.
+ * All run from the POSIX port directly until the NVM tests are
+ * reworked to take a port-supplied flash fixture (then they can
  * lift back into whTestGroup_Server). */
 int whTest_FlashWriteLock(void* ctx);
 int whTest_FlashEraseProgramVerify(void* ctx);
 int whTest_FlashUnitOps(void* ctx);
 int whTest_NvmAddOverwriteDestroy(void* ctx);
+int whTest_NvmFlashLog(void* ctx);
+int whTest_NvmRecovery(void* ctx);
+int whTest_NvmCrc16(void* ctx);
+
+/* POSIX-specific logging tests. The portable log suite (frontend,
+ * macros, ring buffer, mock/ringbuf harness) runs in the Misc group;
+ * these exercise the POSIX file backend, concurrent writers, and a
+ * client/server log smoke test that need pthreads and the host file
+ * system, so they run from the port directly. */
+int whTest_LogPosixFile_Generic(void* ctx);
+int whTest_LogPosixFile(void* ctx);
+int whTest_LogPosixFileConcurrent(void* ctx);
+int whTest_LogClientServerMemTransport(void* ctx);
 
 /*
  * Port-owned contexts. The thread functions fill these in and
@@ -171,6 +188,12 @@ static void* _serverThread(void* arg)
         }
     }
 
+    /* Confirm the request-auth callback actually fired. */
+    rc = whTestPosix_Server_VerifyAuthCallbacks();
+    if (rc != 0 && rc != WH_TEST_SKIPPED && _serverRc == 0) {
+        _serverRc = rc;
+    }
+
     (void)whTestPosix_Server_Cleanup(&_server);
     return NULL;
 }
@@ -261,6 +284,57 @@ int main(void)
         }
         rc = whTestGroup_RunOne("whTest_NvmAddOverwriteDestroy",
             whTest_NvmAddOverwriteDestroy, NULL);
+        if (rc != 0 && rc != WH_TEST_SKIPPED && miscRc == 0) {
+            miscRc = rc;
+        }
+        rc = whTestGroup_RunOne("whTest_NvmFlashLog",
+            whTest_NvmFlashLog, NULL);
+        if (rc != 0 && rc != WH_TEST_SKIPPED && miscRc == 0) {
+            miscRc = rc;
+        }
+        rc = whTestGroup_RunOne("whTest_NvmRecovery",
+            whTest_NvmRecovery, NULL);
+        if (rc != 0 && rc != WH_TEST_SKIPPED && miscRc == 0) {
+            miscRc = rc;
+        }
+        rc = whTestGroup_RunOne("whTest_NvmCrc16", whTest_NvmCrc16, NULL);
+        if (rc != 0 && rc != WH_TEST_SKIPPED && miscRc == 0) {
+            miscRc = rc;
+        }
+        /* POSIX-specific log backend tests. Self-contained (each owns
+         * its own contexts and threads), so run inline before the port
+         * spins up its own server thread. */
+        rc = whTestGroup_RunOne("whTest_LogPosixFile_Generic",
+            whTest_LogPosixFile_Generic, NULL);
+        if (rc != 0 && rc != WH_TEST_SKIPPED && miscRc == 0) {
+            miscRc = rc;
+        }
+        rc = whTestGroup_RunOne("whTest_LogPosixFile",
+            whTest_LogPosixFile, NULL);
+        if (rc != 0 && rc != WH_TEST_SKIPPED && miscRc == 0) {
+            miscRc = rc;
+        }
+        rc = whTestGroup_RunOne("whTest_LogPosixFileConcurrent",
+            whTest_LogPosixFileConcurrent, NULL);
+        if (rc != 0 && rc != WH_TEST_SKIPPED && miscRc == 0) {
+            miscRc = rc;
+        }
+        rc = whTestGroup_RunOne("whTest_LogClientServerMemTransport",
+            whTest_LogClientServerMemTransport, NULL);
+        if (rc != 0 && rc != WH_TEST_SKIPPED && miscRc == 0) {
+            miscRc = rc;
+        }
+        /* Concurrent keygen and cached-key read tests. Both are
+         * self-contained (own shared NVM + client/server pairs), so they run
+         * in this pre-server slot rather than against the live
+         * _server/_client, and both skip themselves unless THREADSAFE +
+         * GLOBAL_KEYS + crypto are compiled in. */
+        rc = whTestGroup_RunOne("whTest_KeygenUniqueIdConcurrent",
+                                whTest_KeygenUniqueIdConcurrent, NULL);
+        if (rc != 0 && rc != WH_TEST_SKIPPED && miscRc == 0) {
+            miscRc = rc;
+        }
+        rc = whTestGroup_RunOne("whTest_KeyReadRace", whTest_KeyReadRace, NULL);
         if (rc != 0 && rc != WH_TEST_SKIPPED && miscRc == 0) {
             miscRc = rc;
         }

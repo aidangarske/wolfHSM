@@ -204,6 +204,148 @@ static const unsigned char testRsa2048PrivKey[] = {
     0x9F, 0xCD, 0xF5, 0xBF};
 #endif /* !NO_RSA */
 
+/* Stub verify callbacks for the return-semantics test. WOLFBOOT_CERT images
+ * skip key/sig loading, so these run without any keystore or NVM setup. */
+static int _testVerifyMethodOk(whServerImgMgrContext*   context,
+                               const whServerImgMgrImg* img, const uint8_t* key,
+                               size_t keySz, const uint8_t* sig, size_t sigSz)
+{
+    (void)context;
+    (void)img;
+    (void)key;
+    (void)keySz;
+    (void)sig;
+    (void)sigSz;
+    return WH_ERROR_OK;
+}
+
+static int _testVerifyMethodNotVerified(whServerImgMgrContext*   context,
+                                        const whServerImgMgrImg* img,
+                                        const uint8_t* key, size_t keySz,
+                                        const uint8_t* sig, size_t sigSz)
+{
+    (void)context;
+    (void)img;
+    (void)key;
+    (void)keySz;
+    (void)sig;
+    (void)sigSz;
+    return WH_ERROR_NOTVERIFIED;
+}
+
+static int _testVerifyActionFail(whServerImgMgrContext*   context,
+                                 const whServerImgMgrImg* img, int verifyResult)
+{
+    (void)context;
+    (void)img;
+    (void)verifyResult;
+    return WH_ERROR_ABORTED;
+}
+
+/*
+ * Return-value semantics: a verify call must not return WH_ERROR_OK when the
+ * verify method fails, the action fails, or a callback is missing, and Init
+ * must reject images registered without callbacks.
+ */
+static int
+whTest_ServerImgMgrServerCfgReturnSemantics(whServerConfig* serverCfg)
+{
+    int                        ret;
+    whServerContext            server[1]    = {0};
+    whServerImgMgrConfig       imgMgrConfig = {0};
+    whServerImgMgrContext      imgMgr       = {0};
+    whServerImgMgrImg          images[2];
+    whServerImgMgrImg          tmpImg;
+    whServerImgMgrVerifyResult result;
+    whServerImgMgrVerifyResult results[2];
+    size_t                     errIdx = 99;
+
+    WH_TEST_RETURN_ON_FAIL(wh_Server_Init(server, serverCfg));
+
+    memset(images, 0, sizeof(images));
+    images[0].imgType      = WH_IMG_MGR_IMG_TYPE_WOLFBOOT_CERT;
+    images[0].verifyMethod = _testVerifyMethodOk;
+    images[0].verifyAction = wh_Server_ImgMgrVerifyActionDefault;
+    images[1]              = images[0];
+    images[1].verifyMethod = _testVerifyMethodNotVerified;
+
+    imgMgrConfig.server     = server;
+    imgMgrConfig.imageCount = 2;
+
+    /* Init must reject a NULL image list and missing callbacks */
+    imgMgrConfig.images = NULL;
+    WH_TEST_ASSERT_RETURN(WH_ERROR_BADARGS ==
+                          wh_Server_ImgMgrInit(&imgMgr, &imgMgrConfig));
+    imgMgrConfig.images    = images;
+    images[1].verifyMethod = NULL;
+    WH_TEST_ASSERT_RETURN(WH_ERROR_BADARGS ==
+                          wh_Server_ImgMgrInit(&imgMgr, &imgMgrConfig));
+    images[1].verifyMethod = _testVerifyMethodNotVerified;
+    images[1].verifyAction = NULL;
+    WH_TEST_ASSERT_RETURN(WH_ERROR_BADARGS ==
+                          wh_Server_ImgMgrInit(&imgMgr, &imgMgrConfig));
+    images[1].verifyAction = wh_Server_ImgMgrVerifyActionDefault;
+
+    WH_TEST_RETURN_ON_FAIL(wh_Server_ImgMgrInit(&imgMgr, &imgMgrConfig));
+
+    /* Verified image with successful action returns OK */
+    ret = wh_Server_ImgMgrVerifyImgIdx(&imgMgr, 0, &result);
+    WH_TEST_ASSERT_RETURN(ret == WH_ERROR_OK);
+    WH_TEST_ASSERT_RETURN(result.verifyMethodResult == WH_ERROR_OK);
+    WH_TEST_ASSERT_RETURN(result.verifyActionResult == WH_ERROR_OK);
+
+    /* Failed verification surfaces in the return value */
+    ret = wh_Server_ImgMgrVerifyImgIdx(&imgMgr, 1, &result);
+    WH_TEST_ASSERT_RETURN(ret == WH_ERROR_NOTVERIFIED);
+    WH_TEST_ASSERT_RETURN(result.verifyMethodResult == WH_ERROR_NOTVERIFIED);
+    WH_TEST_ASSERT_RETURN(result.verifyActionResult == WH_ERROR_NOTVERIFIED);
+
+    /* A failing action surfaces even when verification passed */
+    tmpImg              = images[0];
+    tmpImg.verifyAction = _testVerifyActionFail;
+    ret                 = wh_Server_ImgMgrVerifyImg(&imgMgr, &tmpImg, &result);
+    WH_TEST_ASSERT_RETURN(ret == WH_ERROR_ABORTED);
+    WH_TEST_ASSERT_RETURN(result.verifyMethodResult == WH_ERROR_OK);
+    WH_TEST_ASSERT_RETURN(result.verifyActionResult == WH_ERROR_ABORTED);
+
+    /* A missing callback on a directly-passed image is NOHANDLER, not OK */
+    tmpImg              = images[0];
+    tmpImg.verifyMethod = NULL;
+    ret                 = wh_Server_ImgMgrVerifyImg(&imgMgr, &tmpImg, &result);
+    WH_TEST_ASSERT_RETURN(ret == WH_ERROR_NOHANDLER);
+    WH_TEST_ASSERT_RETURN(result.verifyMethodResult == WH_ERROR_NOHANDLER);
+
+    /* VerifyAll returns the failing image's error and index. Poison the
+     * results with WH_ERROR_OK (0) to prove they are overwritten. */
+    memset(results, 0, sizeof(results));
+    ret = wh_Server_ImgMgrVerifyAll(&imgMgr, results, 2, &errIdx);
+    WH_TEST_ASSERT_RETURN(ret == WH_ERROR_NOTVERIFIED);
+    WH_TEST_ASSERT_RETURN(errIdx == 1);
+    WH_TEST_ASSERT_RETURN(results[0].verifyMethodResult == WH_ERROR_OK);
+    WH_TEST_ASSERT_RETURN(results[1].verifyMethodResult ==
+                          WH_ERROR_NOTVERIFIED);
+
+    /* Re-register with the failing image first: VerifyAll must stop there
+     * and the unvisited image's result must read as failed, not verified */
+    tmpImg    = images[0];
+    images[0] = images[1];
+    images[1] = tmpImg;
+    WH_TEST_RETURN_ON_FAIL(wh_Server_ImgMgrInit(&imgMgr, &imgMgrConfig));
+    memset(results, 0, sizeof(results));
+    errIdx = 99;
+    ret    = wh_Server_ImgMgrVerifyAll(&imgMgr, results, 2, &errIdx);
+    WH_TEST_ASSERT_RETURN(ret == WH_ERROR_NOTVERIFIED);
+    WH_TEST_ASSERT_RETURN(errIdx == 0);
+    WH_TEST_ASSERT_RETURN(results[0].verifyMethodResult ==
+                          WH_ERROR_NOTVERIFIED);
+    WH_TEST_ASSERT_RETURN(results[1].verifyMethodResult == WH_ERROR_ABORTED);
+    WH_TEST_ASSERT_RETURN(results[1].verifyActionResult == WH_ERROR_ABORTED);
+
+    wh_Server_Cleanup(server);
+    WH_TEST_PRINT("IMG_MGR return semantics test completed successfully!\n");
+    return 0;
+}
+
 #ifdef HAVE_ECC
 static int whTest_ServerImgMgrServerCfgEcc256(whServerConfig* serverCfg)
 {
@@ -521,21 +663,22 @@ static int whTest_ServerImgMgrServerCfgEcc256(whServerConfig* serverCfg)
 
     /* Test that the image does not verify with the corrupted signature */
     ret = wh_Server_ImgMgrVerifyImg(&imgMgr, &testImage, &result);
-    if (ret != WH_ERROR_OK) {
-        WH_ERROR_PRINT("ERROR: ECC image verification with corrupted signature failed: "
-               "%d\n",
-               ret);
+    if (ret == WH_ERROR_OK) {
+        WH_ERROR_PRINT("ERROR: ECC image verification with corrupted signature "
+                       "should have failed\n");
         wh_Server_Cleanup(server);
         wc_Sha256Free(&sha);
         wc_ecc_free(&eccKey);
         wc_FreeRng(&rng);
-        return ret;
+        return WH_ERROR_ABORTED;
     }
 
-    /* Verify method result should not be OK */
-    if (result.verifyMethodResult == WH_ERROR_OK) {
-        WH_ERROR_PRINT("ECC verify method with corrupted signature failed: %d\n",
-               result.verifyMethodResult);
+    /* Return value should surface the verify method failure */
+    if (ret != result.verifyMethodResult) {
+        WH_ERROR_PRINT(
+            "ECC corrupted signature return %d does not match verify "
+            "method result %d\n",
+            ret, result.verifyMethodResult);
         wh_Server_Cleanup(server);
         wc_Sha256Free(&sha);
         wc_ecc_free(&eccKey);
@@ -775,18 +918,19 @@ static int whTest_ServerImgMgrServerCfgAes128Cmac(whServerConfig* serverCfg)
 
     /* Test that the image does not verify with the corrupted signature */
     ret = wh_Server_ImgMgrVerifyImg(&imgMgr, &testImage, &result);
-    if (ret != WH_ERROR_OK) {
-        WH_ERROR_PRINT("ERROR: CMAC image verification with corrupted signature "
-               "failed: %d\n",
-               ret);
+    if (ret == WH_ERROR_OK) {
+        WH_ERROR_PRINT(
+            "ERROR: CMAC image verification with corrupted signature "
+            "should have failed\n");
         wh_Server_Cleanup(server);
-        return ret;
+        return WH_ERROR_ABORTED;
     }
 
-    /* Verify method result should not be OK */
-    if (result.verifyMethodResult == WH_ERROR_OK) {
-        WH_ERROR_PRINT("CMAC verify method with corrupted signature failed: %d\n",
-               result.verifyMethodResult);
+    /* Return value should surface the verify method failure */
+    if (ret != result.verifyMethodResult) {
+        WH_ERROR_PRINT("CMAC corrupted signature return %d does not match "
+                       "verify method result %d\n",
+                       ret, result.verifyMethodResult);
         wh_Server_Cleanup(server);
         return WH_ERROR_ABORTED;
     }
@@ -1141,21 +1285,21 @@ static int whTest_ServerImgMgrServerCfgRsa2048(whServerConfig* serverCfg)
 
     /* Test that the image does not verify with the corrupted signature */
     ret = wh_Server_ImgMgrVerifyImg(&imgMgr, &testImage, &result);
-    if (ret != WH_ERROR_OK) {
-        WH_ERROR_PRINT("ERROR: RSA image verification with corrupted signature failed: "
-               "%d\n",
-               ret);
+    if (ret == WH_ERROR_OK) {
+        WH_ERROR_PRINT("ERROR: RSA image verification with corrupted signature "
+                       "should have failed\n");
         wh_Server_Cleanup(server);
         wc_Sha256Free(&sha);
         wc_FreeRsaKey(&rsaKey);
         wc_FreeRng(&rng);
-        return ret;
+        return WH_ERROR_ABORTED;
     }
 
-    /* Verify method result should not be OK */
-    if (result.verifyMethodResult == WH_ERROR_OK) {
-        WH_ERROR_PRINT("RSA verify method with corrupted signature failed: %d\n",
-               result.verifyMethodResult);
+    /* Return value should surface the verify method failure */
+    if (ret != result.verifyMethodResult) {
+        WH_ERROR_PRINT("RSA corrupted signature return %d does not match "
+                       "verify method result %d\n",
+                       ret, result.verifyMethodResult);
         wh_Server_Cleanup(server);
         wc_Sha256Free(&sha);
         wc_FreeRsaKey(&rsaKey);
@@ -1294,14 +1438,16 @@ whTest_ServerImgMgrServerCfgWolfBootRsa4096(whServerConfig* serverCfg)
         corruptImage.addr = (uintptr_t)corrupt_fw;
 
         ret = wh_Server_ImgMgrVerifyImg(&imgMgr, &corruptImage, &result);
-        if (ret != WH_ERROR_OK) {
-            WH_ERROR_PRINT("wolfBoot corrupt verify call failed: %d\n", ret);
-            wh_Server_Cleanup(server);
-            return ret;
-        }
-        if (result.verifyMethodResult == WH_ERROR_OK) {
+        if (ret == WH_ERROR_OK) {
             WH_ERROR_PRINT(
                 "wolfBoot corrupt verify should have failed but succeeded\n");
+            wh_Server_Cleanup(server);
+            return WH_ERROR_ABORTED;
+        }
+        if (ret != result.verifyMethodResult) {
+            WH_ERROR_PRINT("wolfBoot corrupt verify return %d does not match "
+                           "verify method result %d\n",
+                           ret, result.verifyMethodResult);
             wh_Server_Cleanup(server);
             return WH_ERROR_ABORTED;
         }
@@ -1400,15 +1546,16 @@ whTest_ServerImgMgrServerCfgWolfBootCertChainRsa4096(whServerConfig* serverCfg)
         corruptImage.addr = (uintptr_t)corrupt_fw;
 
         ret = wh_Server_ImgMgrVerifyImg(&imgMgr, &corruptImage, &result);
-        if (ret != WH_ERROR_OK) {
-            WH_ERROR_PRINT(
-                "wolfBoot cert chain corrupt verify call failed: %d\n", ret);
-            wh_Server_Cleanup(server);
-            return ret;
-        }
-        if (result.verifyMethodResult == WH_ERROR_OK) {
+        if (ret == WH_ERROR_OK) {
             WH_ERROR_PRINT("wolfBoot cert chain corrupt verify should have "
                            "failed but succeeded\n");
+            wh_Server_Cleanup(server);
+            return WH_ERROR_ABORTED;
+        }
+        if (ret != result.verifyMethodResult) {
+            WH_ERROR_PRINT("wolfBoot cert chain corrupt verify return %d does "
+                           "not match verify method result %d\n",
+                           ret, result.verifyMethodResult);
             wh_Server_Cleanup(server);
             return WH_ERROR_ABORTED;
         }
@@ -1486,6 +1633,14 @@ int whTest_ServerImgMgr(whTestNvmBackendType nvmType)
     rc = wh_Nvm_Init(nvm, n_conf);
     if (rc != 0) {
         WH_ERROR_PRINT("Failed to initialize NVM: %d\n", rc);
+        return rc;
+    }
+
+    /* Return-value semantics (no crypto algorithms required) */
+    rc = whTest_ServerImgMgrServerCfgReturnSemantics(s_conf);
+    if (rc != 0) {
+        WH_ERROR_PRINT("Image manager return semantics tests failed: %d\n", rc);
+        wh_Nvm_Cleanup(nvm);
         return rc;
     }
 

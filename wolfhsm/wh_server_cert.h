@@ -40,6 +40,11 @@ int wh_Server_CertInit(whServerContext* server);
 
 /**
  * @brief Add a trusted certificate to NVM storage
+ *
+ * Server-only flags are stripped from the request. Returns WH_ERROR_ACCESS
+ * if an existing object at this ID may not be modified (e.g. a trusted KEK
+ * or anything marked NONMODIFIABLE).
+ *
  * @param server The server context
  * @param id The NVM ID to store the certificate under
  * @param cert The certificate data buffer
@@ -54,6 +59,10 @@ int wh_Server_CertAddTrusted(whServerContext* server, whNvmId id,
 
 /**
  * @brief Delete a trusted certificate from NVM storage
+ *
+ * Returns WH_ERROR_ACCESS if the object at this ID may not be destroyed
+ * (e.g. a trusted KEK or anything marked NONDESTROYABLE).
+ *
  * @param server The server context
  * @param id The NVM ID of the certificate to delete
  * @return WH_ERROR_OK on success, error code on failure
@@ -130,6 +139,26 @@ int wh_Server_CertVerifyMultiRoot(whServerContext* server, const uint8_t* cert,
                                   uint16_t numRoots, whCertFlags flags,
                                   whNvmFlags cachedKeyFlags,
                                   whKeyId*   inout_keyId);
+
+#if defined(WOLFHSM_CFG_CERTIFICATE_MANAGER) && !defined(WOLFHSM_CFG_NO_CRYPTO)
+/**
+ * @brief Register a verify callback at runtime.
+ *
+ * Replaces the callback previously set via whServerCertConfig.verifyCb (or by
+ * a prior call to this function). Pass NULL to unregister.
+ *
+ * The callback is applied to the per-request WOLFSSL_CERT_MANAGER created by
+ * wh_Server_CertVerify, so it participates in chain verification the same way
+ * a callback registered with wolfSSL_CertManagerSetVerify would. Verify-cache
+ * hits (when WOLFHSM_CFG_CERTIFICATE_VERIFY_CACHE is enabled) bypass the
+ * callback because they bypass wolfSSL's verify path entirely.
+ *
+ * @param server The server context.
+ * @param cb     The callback to register, or NULL to unregister.
+ * @return WH_ERROR_OK on success, WH_ERROR_BADARGS if server is NULL.
+ */
+int wh_Server_CertSetVerifyCb(whServerContext* server, VerifyCallback cb);
+#endif /* WOLFHSM_CFG_CERTIFICATE_MANAGER && !WOLFHSM_CFG_NO_CRYPTO */
 
 #if defined(WOLFHSM_CFG_CERTIFICATE_MANAGER_ACERT)
 /**

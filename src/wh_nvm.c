@@ -60,6 +60,12 @@ static int wh_Nvm_CheckPolicy(whNvmContext* context, whNvmOp op, whNvmId id,
         *existing_meta = meta;
     }
 
+    /* A server-only key (e.g. a trusted KEK, WH_NVM_FLAGS_TRUSTED) must be
+     * immutable through the client NVM API regardless of its other flags. */
+    if (meta.flags & WH_NVM_FLAGS_TRUSTED) {
+        return WH_ERROR_ACCESS;
+    }
+
     switch (op) {
         case WH_NVM_OP_ADD:
             if (meta.flags & WH_NVM_FLAGS_NONMODIFIABLE) {
@@ -104,13 +110,33 @@ int wh_Nvm_Init(whNvmContext* context, const whNvmConfig* config)
     memset(&context->globalCache, 0, sizeof(context->globalCache));
 #endif
 
+#ifdef WOLFHSM_CFG_CERTIFICATE_VERIFY_CACHE_GLOBAL
+    /* Initialize the global cert verify cache. Default to enabled so a fresh
+     * NVM context preserves pre-runtime-toggle behavior; clients can disable
+     * via wh_Client_CertVerifyCacheSetEnabled. */
+    memset(&context->globalCertVerifyCache, 0,
+           sizeof(context->globalCertVerifyCache));
+    context->globalCertVerifyCache.enabled = 1;
+#endif
+
 #ifdef WOLFHSM_CFG_THREADSAFE
     /* Initialize lock (NULL lockConfig = no-op locking) */
     rc = wh_Lock_Init(&context->lock, config->lockConfig);
     if (rc != WH_ERROR_OK) {
         return rc;
     }
+#ifdef WOLFHSM_CFG_CERTIFICATE_VERIFY_CACHE_GLOBAL
+    /* Initialize the global cert verify cache lock. Distinct lock from the
+     * NVM lock so cert-cache traffic and NVM I/O don't serialize each other.
+     * NULL config => no-op locking, same as the NVM lock above. */
+    rc = wh_Lock_Init(&context->globalCertVerifyCache.lock,
+                      config->certVerifyCacheLockConfig);
+    if (rc != WH_ERROR_OK) {
+        (void)wh_Lock_Cleanup(&context->lock);
+        return rc;
+    }
 #endif
+#endif /* WOLFHSM_CFG_THREADSAFE */
 
     if (context->cb != NULL && context->cb->Init != NULL) {
         rc = context->cb->Init(context->context, config->config);
@@ -118,6 +144,9 @@ int wh_Nvm_Init(whNvmContext* context, const whNvmConfig* config)
             context->cb = NULL;
             context->context = NULL;
 #ifdef WOLFHSM_CFG_THREADSAFE
+#ifdef WOLFHSM_CFG_CERTIFICATE_VERIFY_CACHE_GLOBAL
+            (void)wh_Lock_Cleanup(&context->globalCertVerifyCache.lock);
+#endif
             (void)wh_Lock_Cleanup(&context->lock);
 #endif
         }
@@ -140,6 +169,14 @@ int wh_Nvm_Cleanup(whNvmContext* context)
     memset(&context->globalCache, 0, sizeof(context->globalCache));
 #endif
 
+#ifdef WOLFHSM_CFG_CERTIFICATE_VERIFY_CACHE_GLOBAL
+    /* Clear cache slots/writeIdx but keep the embedded lock intact until its
+     * own cleanup below. */
+    memset(context->globalCertVerifyCache.slots, 0,
+           sizeof(context->globalCertVerifyCache.slots));
+    context->globalCertVerifyCache.writeIdx = 0;
+#endif
+
     /* No callback? Return ABORTED */
     if (context->cb->Cleanup == NULL) {
         rc = WH_ERROR_ABORTED;
@@ -149,6 +186,9 @@ int wh_Nvm_Cleanup(whNvmContext* context)
     }
 
 #ifdef WOLFHSM_CFG_THREADSAFE
+#ifdef WOLFHSM_CFG_CERTIFICATE_VERIFY_CACHE_GLOBAL
+    (void)wh_Lock_Cleanup(&context->globalCertVerifyCache.lock);
+#endif
     (void)wh_Lock_Cleanup(&context->lock);
 #endif
 
@@ -229,17 +269,28 @@ int wh_Nvm_AddObject(whNvmContext* context, whNvmMetadata *meta,
     return context->cb->AddObject(context->context, meta, data_len, data);
 }
 
-int wh_Nvm_AddObjectChecked(whNvmContext* context, whNvmMetadata* meta,
+int wh_Nvm_AddObjectChecked(whNvmContext* context, const whNvmMetadata* meta,
                             whNvmSize data_len, const uint8_t* data)
 {
-    int ret;
+    int           ret;
+    whNvmMetadata sanitized;
+
+    if (meta == NULL) {
+        return WH_ERROR_BADARGS;
+    }
 
     ret = wh_Nvm_CheckPolicy(context, WH_NVM_OP_ADD, meta->id, NULL);
     if (ret != WH_ERROR_OK && ret != WH_ERROR_NOTFOUND) {
         return ret;
     }
 
-    return wh_Nvm_AddObject(context, meta, data_len, data);
+    /* Copy before sanitizing: meta may point at a read-only client DMA mapping,
+     * so we must not write through it. Strip server-only flags a client may
+     * never set. */
+    sanitized = *meta;
+    sanitized.flags &= ~WH_NVM_FLAGS_SERVER_ONLY;
+
+    return wh_Nvm_AddObject(context, &sanitized, data_len, data);
 }
 
 int wh_Nvm_List(whNvmContext* context,
@@ -302,7 +353,8 @@ int wh_Nvm_DestroyObjectsChecked(whNvmContext* context, whNvmId list_count,
 
     for (i = 0; i < list_count; i++) {
         ret = wh_Nvm_CheckPolicy(context, WH_NVM_OP_DESTROY, id_list[i], NULL);
-        if (ret != WH_ERROR_OK) {
+        /* An absent id has no policy to enforce and is not an error */
+        if ((ret != WH_ERROR_OK) && (ret != WH_ERROR_NOTFOUND)) {
             return ret;
         }
     }

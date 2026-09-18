@@ -187,10 +187,28 @@ int wh_Bench_Mod_Sha512Dma(whClientContext* client, whBenchOpContext* ctx,
 /*
  * SHA3 benchmark module prototypes (wh_bench_mod_sha3.c)
  */
+int wh_Bench_Mod_Sha3224(whClientContext* client, whBenchOpContext* ctx, int id,
+                         void* params);
+
+int wh_Bench_Mod_Sha3224Dma(whClientContext* client, whBenchOpContext* ctx,
+                            int id, void* params);
+
 int wh_Bench_Mod_Sha3256(whClientContext* client, whBenchOpContext* ctx, int id,
                          void* params);
 
 int wh_Bench_Mod_Sha3256Dma(whClientContext* client, whBenchOpContext* ctx,
+                            int id, void* params);
+
+int wh_Bench_Mod_Sha3384(whClientContext* client, whBenchOpContext* ctx, int id,
+                         void* params);
+
+int wh_Bench_Mod_Sha3384Dma(whClientContext* client, whBenchOpContext* ctx,
+                            int id, void* params);
+
+int wh_Bench_Mod_Sha3512(whClientContext* client, whBenchOpContext* ctx, int id,
+                         void* params);
+
+int wh_Bench_Mod_Sha3512Dma(whClientContext* client, whBenchOpContext* ctx,
                             int id, void* params);
 
 /*
@@ -202,10 +220,28 @@ int wh_Bench_Mod_HmacSha256(whClientContext* client, whBenchOpContext* ctx,
 int wh_Bench_Mod_HmacSha256Dma(whClientContext* client, whBenchOpContext* ctx,
                                int id, void* params);
 
+int wh_Bench_Mod_HmacSha3224(whClientContext* client, whBenchOpContext* ctx,
+                             int id, void* params);
+
+int wh_Bench_Mod_HmacSha3224Dma(whClientContext* client, whBenchOpContext* ctx,
+                                int id, void* params);
+
 int wh_Bench_Mod_HmacSha3256(whClientContext* client, whBenchOpContext* ctx,
                              int id, void* params);
 
 int wh_Bench_Mod_HmacSha3256Dma(whClientContext* client, whBenchOpContext* ctx,
+                                int id, void* params);
+
+int wh_Bench_Mod_HmacSha3384(whClientContext* client, whBenchOpContext* ctx,
+                             int id, void* params);
+
+int wh_Bench_Mod_HmacSha3384Dma(whClientContext* client, whBenchOpContext* ctx,
+                                int id, void* params);
+
+int wh_Bench_Mod_HmacSha3512(whClientContext* client, whBenchOpContext* ctx,
+                             int id, void* params);
+
+int wh_Bench_Mod_HmacSha3512Dma(whClientContext* client, whBenchOpContext* ctx,
                                 int id, void* params);
 
 /*
@@ -378,5 +414,76 @@ int wh_Bench_Mod_MlDsa87KeyGen(whClientContext* client, whBenchOpContext* ctx,
 
 int wh_Bench_Mod_MlDsa87KeyGenDma(whClientContext*  client,
                                   whBenchOpContext* ctx, int id, void* params);
+
+/*
+ * ML-KEM benchmark module prototypes (wh_bench_mod_mlkem.c)
+ */
+int wh_Bench_Mod_MlKem512KeyGen(whClientContext* client, whBenchOpContext* ctx,
+                                int id, void* params);
+int wh_Bench_Mod_MlKem512KeyGenDma(whClientContext*  client,
+                                   whBenchOpContext* ctx, int id, void* params);
+int wh_Bench_Mod_MlKem512Encaps(whClientContext* client, whBenchOpContext* ctx,
+                                int id, void* params);
+int wh_Bench_Mod_MlKem512EncapsDma(whClientContext*  client,
+                                   whBenchOpContext* ctx, int id, void* params);
+int wh_Bench_Mod_MlKem512Decaps(whClientContext* client, whBenchOpContext* ctx,
+                                int id, void* params);
+int wh_Bench_Mod_MlKem512DecapsDma(whClientContext*  client,
+                                   whBenchOpContext* ctx, int id, void* params);
+
+int wh_Bench_Mod_MlKem768KeyGen(whClientContext* client, whBenchOpContext* ctx,
+                                int id, void* params);
+int wh_Bench_Mod_MlKem768KeyGenDma(whClientContext*  client,
+                                   whBenchOpContext* ctx, int id, void* params);
+int wh_Bench_Mod_MlKem768Encaps(whClientContext* client, whBenchOpContext* ctx,
+                                int id, void* params);
+int wh_Bench_Mod_MlKem768EncapsDma(whClientContext*  client,
+                                   whBenchOpContext* ctx, int id, void* params);
+int wh_Bench_Mod_MlKem768Decaps(whClientContext* client, whBenchOpContext* ctx,
+                                int id, void* params);
+int wh_Bench_Mod_MlKem768DecapsDma(whClientContext*  client,
+                                   whBenchOpContext* ctx, int id, void* params);
+
+int wh_Bench_Mod_MlKem1024KeyGen(whClientContext* client,
+                                 whBenchOpContext* ctx, int id, void* params);
+int wh_Bench_Mod_MlKem1024KeyGenDma(whClientContext*  client,
+                                    whBenchOpContext* ctx, int id,
+                                    void* params);
+int wh_Bench_Mod_MlKem1024Encaps(whClientContext* client,
+                                 whBenchOpContext* ctx, int id, void* params);
+int wh_Bench_Mod_MlKem1024EncapsDma(whClientContext*  client,
+                                    whBenchOpContext* ctx, int id,
+                                    void* params);
+int wh_Bench_Mod_MlKem1024Decaps(whClientContext* client,
+                                 whBenchOpContext* ctx, int id, void* params);
+int wh_Bench_Mod_MlKem1024DecapsDma(whClientContext*  client,
+                                    whBenchOpContext* ctx, int id,
+                                    void* params);
+
+/*
+ * LMS benchmark module prototypes (wh_bench_mod_lms.c)
+ *
+ * LMS is stateful (hash-based) and DMA-only in wolfHSM, so there is a single
+ * variant per operation (no non-DMA counterpart).
+ */
+int wh_Bench_Mod_LmsKeyGen(whClientContext* client, whBenchOpContext* ctx,
+                           int id, void* params);
+int wh_Bench_Mod_LmsSign(whClientContext* client, whBenchOpContext* ctx, int id,
+                         void* params);
+int wh_Bench_Mod_LmsVerify(whClientContext* client, whBenchOpContext* ctx,
+                           int id, void* params);
+
+/*
+ * XMSS benchmark module prototypes (wh_bench_mod_xmss.c)
+ *
+ * XMSS is stateful (hash-based) and DMA-only in wolfHSM, so there is a single
+ * variant per operation (no non-DMA counterpart).
+ */
+int wh_Bench_Mod_XmssKeyGen(whClientContext* client, whBenchOpContext* ctx,
+                            int id, void* params);
+int wh_Bench_Mod_XmssSign(whClientContext* client, whBenchOpContext* ctx,
+                          int id, void* params);
+int wh_Bench_Mod_XmssVerify(whClientContext* client, whBenchOpContext* ctx,
+                            int id, void* params);
 
 #endif /* WH_BENCH_MOD_ALL_H_ */

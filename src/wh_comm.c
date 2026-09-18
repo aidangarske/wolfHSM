@@ -151,18 +151,22 @@ int wh_CommClient_SendRequest(whCommClient* context, uint16_t magic,
 }
 
 /* If a response packet has been buffered, get the header and copy the data out
- * of the buffer.
+ * of the buffer. data_size is the capacity of the caller-supplied data buffer;
+ * if the received payload exceeds it, returns WH_ERROR_BUFFER_SIZE with
+ * *out_size set to the required size. On success *out_size holds the actual
+ * payload size.
  */
-int wh_CommClient_RecvResponse(whCommClient* context,
-        uint16_t* out_magic, uint16_t* out_kind, uint16_t* out_seq,
-        uint16_t* out_size, void* data)
+int wh_CommClient_RecvResponse(whCommClient* context, uint16_t* out_magic,
+                               uint16_t* out_kind, uint16_t* out_seq,
+                               uint16_t* out_size, uint16_t data_size,
+                               void* data)
 {
     int rc = 0;
     uint16_t magic = 0;
     uint16_t kind = 0;
     uint16_t seq = 0;
     uint16_t size = sizeof(context->packet);
-    uint16_t data_size = 0;
+    uint16_t payload_size = 0;
 
     if ((context == NULL) || (context->hdr == NULL) ||
         (context->initialized == 0) || (context->transport_cb == NULL) ||
@@ -183,14 +187,17 @@ int wh_CommClient_RecvResponse(whCommClient* context,
 #ifdef WOLFHSM_CFG_ENABLE_TIMEOUT
         (void)wh_Timeout_Stop(&context->respTimeout);
 #endif
-        if (size < sizeof(*context->hdr)) {
-            /* Size is too small - transport-level corruption; treat as fatal
-             * and clear pending since the caller must tear down anyway. */
+        if ((size < sizeof(*context->hdr)) ||
+            (size > WH_COMM_MTU)) {
+            /* Size out of range - transport-level corruption (the transport
+             * clamps its copy, but reports the true peer-controlled length, so
+             * an oversized value here means a truncated/bogus message). Treat as
+             * fatal and clear pending since the caller must tear down anyway. */
             context->pending = 0;
             rc = WH_ERROR_ABORTED;
         }
         if (rc == 0) {
-            data_size = size - sizeof(*context->hdr);
+            payload_size = size - sizeof(*context->hdr);
             magic = context->hdr->magic;
             kind = wh_Translate16(magic, context->hdr->kind);
             seq = wh_Translate16(magic, context->hdr->seq);
@@ -221,15 +228,20 @@ int wh_CommClient_RecvResponse(whCommClient* context,
                 return WH_ERROR_NOTREADY;
             }
 
-            if (    (data != NULL) &&
-                    (data_size != 0) &&
-                    (data != context->data)) {
-                memcpy(data, context->data, data_size);
+            if ((data != NULL) && (payload_size != 0) &&
+                (data != context->data)) {
+                if (payload_size > data_size) {
+                    rc = WH_ERROR_BUFFER_SIZE;
+                }
+                else {
+                    memcpy(data, context->data, payload_size);
+                }
             }
             if (out_magic != NULL) *out_magic = magic;
             if (out_kind != NULL) *out_kind = kind;
             if (out_seq != NULL) *out_seq = seq;
-            if (out_size != NULL) *out_size = data_size;
+            if (out_size != NULL)
+                *out_size = payload_size;
             context->pending = 0;
         }
     }
@@ -350,14 +362,14 @@ int wh_CommServer_Init(whCommServer* context, const whCommServerConfig* config,
 
 int wh_CommServer_RecvRequest(whCommServer* context,
         uint16_t* out_magic, uint16_t* out_kind, uint16_t* out_seq,
-        uint16_t* out_size, void* data)
+        uint16_t* out_size, uint16_t data_size, void* data)
 {
     int rc = 0;
     uint16_t magic = 0;
     uint16_t kind = 0;
     uint16_t seq = 0;
     uint16_t size = sizeof(context->packet);
-    uint16_t data_size = 0;
+    uint16_t req_size = 0;
 
     if ((context == NULL) || (context->hdr == NULL) ||
         (context->initialized == 0) || (context->transport_cb == NULL) ||
@@ -369,25 +381,33 @@ int wh_CommServer_RecvRequest(whCommServer* context,
             &size,
             context->packet);
     if (rc == 0) {
-        if (size < sizeof(*context->hdr)) {
+        /* size is the true peer-controlled length; the transport clamps its own
+         * copy, so an out-of-range value here is transport-level corruption. */
+        if ((size < sizeof(*context->hdr)) ||
+            (size > WH_COMM_MTU)) {
             rc = WH_ERROR_ABORTED;
         }
         if (rc == 0) {
-            data_size = size - sizeof(*context->hdr);
+            req_size = size - sizeof(*context->hdr);
             magic = context->hdr->magic;
             kind = wh_Translate16(magic, context->hdr->kind);
             seq = wh_Translate16(magic, context->hdr->seq);
 
-            /* Copy the data from the internal buffer if necessary */
-            if (    (data != NULL) &&
-                    (data_size != 0) &&
-                    (data != context->data) ) {
-                memcpy(data, context->data, data_size);
+            if ((data != NULL) && (req_size > data_size)) {
+                rc = WH_ERROR_BUFFER_SIZE;
+            }
+            else {
+                /* Copy the data from the internal buffer if necessary */
+                if (    (data != NULL) &&
+                        (req_size != 0) &&
+                        (data != context->data) ) {
+                    memcpy(data, context->data, req_size);
+                }
             }
             if (out_magic != NULL) *out_magic = magic;
             if (out_kind != NULL) *out_kind = kind;
             if (out_seq != NULL) *out_seq = seq;
-            if (out_size != NULL) *out_size = data_size;
+            if (out_size != NULL) *out_size = req_size;
         }
     }
     return rc;

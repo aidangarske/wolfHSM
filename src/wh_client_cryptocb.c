@@ -47,6 +47,13 @@
 #include "wolfssl/wolfcrypt/ecc.h"
 #include "wolfssl/wolfcrypt/sha256.h"
 #include "wolfssl/wolfcrypt/sha512.h"
+#include "wolfssl/wolfcrypt/wc_mlkem.h"
+#if defined(WOLFSSL_HAVE_LMS)
+#include "wolfssl/wolfcrypt/wc_lms.h"
+#endif
+#if defined(WOLFSSL_HAVE_XMSS)
+#include "wolfssl/wolfcrypt/wc_xmss.h"
+#endif
 
 #include "wolfhsm/wh_crypto.h"
 #include "wolfhsm/wh_client_crypto.h"
@@ -54,7 +61,27 @@
 #include "wolfhsm/wh_message_crypto.h"
 
 
-#if defined(HAVE_DILITHIUM) || defined(HAVE_FALCON)
+#if defined(WOLFSSL_HAVE_MLKEM)
+static int _handlePqcKemKeyGen(whClientContext* ctx, wc_CryptoInfo* info,
+                               int useDma);
+static int _handlePqcEncaps(whClientContext* ctx, wc_CryptoInfo* info,
+                            int useDma);
+static int _handlePqcDecaps(whClientContext* ctx, wc_CryptoInfo* info,
+                            int useDma);
+#endif /* WOLFSSL_HAVE_MLKEM */
+#if defined(WOLFSSL_HAVE_LMS) || defined(WOLFSSL_HAVE_XMSS)
+static int _handlePqcStatefulSigKeyGen(whClientContext* ctx,
+                                       wc_CryptoInfo* info, int useDma);
+static int _handlePqcStatefulSigSign(whClientContext* ctx, wc_CryptoInfo* info,
+                                     int useDma);
+static int _handlePqcStatefulSigVerify(whClientContext* ctx,
+                                       wc_CryptoInfo* info, int useDma);
+static int _handlePqcStatefulSigSigsLeft(whClientContext* ctx,
+                                         wc_CryptoInfo* info, int useDma);
+#endif /* WOLFSSL_HAVE_LMS || WOLFSSL_HAVE_XMSS */
+
+
+#if defined(WOLFSSL_HAVE_MLDSA) || defined(HAVE_FALCON)
 static int _handlePqcSigKeyGen(whClientContext* ctx, wc_CryptoInfo* info,
                                int useDma);
 static int _handlePqcSign(whClientContext* ctx, wc_CryptoInfo* info,
@@ -63,9 +90,43 @@ static int _handlePqcVerify(whClientContext* ctx, wc_CryptoInfo* info,
                             int useDma);
 static int _handlePqcSigCheckPrivKey(whClientContext* ctx, wc_CryptoInfo* info,
                                      int useDma);
-#endif /* HAVE_DILITHIUM || HAVE_FALCON */
+#endif /* WOLFSSL_HAVE_MLDSA || HAVE_FALCON */
 
 int wh_Client_CryptoCb(int devId, wc_CryptoInfo* info, void* inCtx)
+{
+    int ret;
+
+    if ((devId == INVALID_DEVID) || (info == NULL) || (inCtx == NULL)) {
+        return BAD_FUNC_ARG;
+    }
+
+#ifdef WOLFHSM_CFG_DMA
+    /* If the client prefers DMA operations, dispatch to the DMA callback first
+     * and fall back to the standard (non-DMA) callback if the algorithm is not
+     * supported by the DMA callback. */
+    if (((whClientContext*)inCtx)->dma.preferDma) {
+        ret = wh_Client_CryptoCbDma(devId, info, inCtx);
+        if (ret == CRYPTOCB_UNAVAILABLE) {
+            ret = wh_Client_CryptoCbStd(devId, info, inCtx);
+        }
+    }
+    else
+#endif /* WOLFHSM_CFG_DMA */
+    {
+        /* DMA not preferred (or not compiled in); use the standard callback */
+        ret = wh_Client_CryptoCbStd(devId, info, inCtx);
+    }
+
+    /* Propagate the error unchanged so if the algo is unsupported
+     * (CRYPTOCB_UNAVAILABLE), wolfCrypt can fall back to its default
+     * (software) implementation for operations wolfHSM does not offload.
+     * Eventually we want this to be a hard error, but there are edge cases
+     * around compound operations that need to be carefully handled and may
+     * require changes to wolfCrypt to successfully facilitate. */
+    return ret;
+}
+
+int wh_Client_CryptoCbStd(int devId, wc_CryptoInfo* info, void* inCtx)
 {
     /* III When possible, return wolfCrypt-enumerated errors */
     int ret = CRYPTOCB_UNAVAILABLE;
@@ -311,20 +372,61 @@ int wh_Client_CryptoCb(int devId, wc_CryptoInfo* info, void* inCtx)
         } break;
 #endif /* HAVE_ECC_VERIFY */
 
-#ifdef HAVE_ECC_CHECK_KEY
-        case WC_PK_TYPE_EC_CHECK_PRIV_KEY:
-        {
-#if 0
-            /* TODO: Expose this and add wolfcrypt functions to test */
+        case WC_PK_TYPE_EC_MAKE_PUB: {
             /* Extract info parameters */
-            ecc_key* key            = info->pk.ecc_check.key;
-            const uint8_t* pub_key  = info->pk.ecc_check.pubKey;
-            uint32_t pub_key_len    = info->pk.ecc_check.pubKeySz;
+            ecc_key* key         = info->pk.ecc_make_pub.key;
+            uint8_t* pub_out     = (uint8_t*)info->pk.ecc_make_pub.pubOut;
+            word32*  out_pub_len = info->pk.ecc_make_pub.pubOutSz;
 
-            ret = wh_Client_EccCheckPubKey(ctx, key, pub_key, pub_key_len);
-#else
+            uint16_t pub_len = 0;
+            if (out_pub_len != NULL) {
+                /* Clamp rather than truncate: an oversized capacity must not
+                 * wrap to a small one and provoke a spurious BUFFER_E. */
+                pub_len = (*out_pub_len > UINT16_MAX)
+                              ? UINT16_MAX
+                              : (uint16_t)(*out_pub_len);
+            }
+
+            ret = wh_Client_EccMakePub(ctx, key, pub_out, &pub_len);
+            /* Propagate updated length on BUFFER_SIZE so callers can re-call
+             * with a sufficiently large output buffer. */
+            if (((ret == WH_ERROR_OK) || (ret == WH_ERROR_BUFFER_SIZE)) &&
+                (out_pub_len != NULL)) {
+                *out_pub_len = pub_len;
+            }
+            if (ret == WH_ERROR_BADARGS) {
+                ret = BAD_FUNC_ARG;
+            }
+            else if (ret == WH_ERROR_BUFFER_SIZE) {
+                ret = BUFFER_E;
+            }
+        } break;
+
+#ifdef HAVE_ECC_CHECK_KEY
+        case WC_PK_TYPE_EC_CHECK_PUB_KEY: {
+            /* Extract info parameters */
+            ecc_key*       key = info->pk.ecc_check_pub.key;
+            const uint8_t* pub_key =
+                (const uint8_t*)info->pk.ecc_check_pub.pubKey;
+            word32 pub_key_len = info->pk.ecc_check_pub.pubKeySz;
+            int    check_order = info->pk.ecc_check_pub.checkOrder;
+            int    check_priv  = info->pk.ecc_check_pub.checkPriv;
+
+            if (pub_key_len > UINT16_MAX) {
+                ret = BAD_FUNC_ARG;
+            }
+            else {
+                ret = wh_Client_EccCheckPubKey(ctx, key, pub_key,
+                                               (uint16_t)pub_key_len,
+                                               check_order, check_priv);
+                if (ret == WH_ERROR_BADARGS) {
+                    ret = BAD_FUNC_ARG;
+                }
+            }
+        } break;
+
+        case WC_PK_TYPE_EC_CHECK_PRIV_KEY: {
             ret = CRYPTOCB_UNAVAILABLE;
-#endif
         } break;
 #endif /* HAVE_ECC_CHECK_KEY */
 
@@ -365,6 +467,7 @@ int wh_Client_CryptoCb(int devId, wc_CryptoInfo* info, void* inCtx)
                 *out_len = len;
             }
         } break;
+#endif /* HAVE_CURVE25519 */
 
 #ifdef HAVE_ED25519
         case WC_PK_TYPE_ED25519_KEYGEN: {
@@ -427,9 +530,41 @@ int wh_Client_CryptoCb(int devId, wc_CryptoInfo* info, void* inCtx)
             }
         } break;
 #endif /* HAVE_ED25519 */
-#endif /* HAVE_CURVE25519 */
 
-#if defined(HAVE_DILITHIUM) || defined(HAVE_FALCON)
+#if defined(WOLFSSL_HAVE_MLKEM)
+        case WC_PK_TYPE_PQC_KEM_KEYGEN:
+            ret = _handlePqcKemKeyGen(ctx, info, 0);
+            break;
+
+        case WC_PK_TYPE_PQC_KEM_ENCAPS:
+            ret = _handlePqcEncaps(ctx, info, 0);
+            break;
+
+        case WC_PK_TYPE_PQC_KEM_DECAPS:
+            ret = _handlePqcDecaps(ctx, info, 0);
+            break;
+
+#endif /* WOLFSSL_HAVE_MLKEM */
+#if defined(WOLFSSL_HAVE_LMS) || defined(WOLFSSL_HAVE_XMSS)
+        case WC_PK_TYPE_PQC_STATEFUL_SIG_KEYGEN:
+            ret = _handlePqcStatefulSigKeyGen(ctx, info, 0);
+            break;
+
+        case WC_PK_TYPE_PQC_STATEFUL_SIG_SIGN:
+            ret = _handlePqcStatefulSigSign(ctx, info, 0);
+            break;
+
+        case WC_PK_TYPE_PQC_STATEFUL_SIG_VERIFY:
+            ret = _handlePqcStatefulSigVerify(ctx, info, 0);
+            break;
+
+        case WC_PK_TYPE_PQC_STATEFUL_SIG_SIGS_LEFT:
+            ret = _handlePqcStatefulSigSigsLeft(ctx, info, 0);
+            break;
+
+#endif /* WOLFSSL_HAVE_LMS || WOLFSSL_HAVE_XMSS */
+
+#if defined(WOLFSSL_HAVE_MLDSA) || defined(HAVE_FALCON)
         case WC_PK_TYPE_PQC_SIG_KEYGEN:
             ret = _handlePqcSigKeyGen(ctx, info, 0);
             break;
@@ -446,7 +581,7 @@ int wh_Client_CryptoCb(int devId, wc_CryptoInfo* info, void* inCtx)
             ret = _handlePqcSigCheckPrivKey(ctx, info, 0);
             break;
 
-#endif /* HAVE_DILITHIUM || HAVE_FALCON */
+#endif /* WOLFSSL_HAVE_MLDSA || HAVE_FALCON */
 
         case WC_PK_TYPE_NONE:
         default:
@@ -534,6 +669,53 @@ int wh_Client_CryptoCb(int devId, wc_CryptoInfo* info, void* inCtx)
                 ret = wh_Client_Sha512(ctx, sha, in, inLen, out);
             } break;
 #endif /* WOLFSSL_SHA512 && WOLFSSL_SHA512_HASHTYPE */
+#if defined(WOLFSSL_SHA3)
+            case WC_HASH_TYPE_SHA3_224:
+            case WC_HASH_TYPE_SHA3_256:
+            case WC_HASH_TYPE_SHA3_384:
+            case WC_HASH_TYPE_SHA3_512: {
+                wc_Sha3* sha = info->hash.sha3;
+#ifdef WOLFSSL_HASH_FLAGS
+                /* Keccak-mode SHA3 (legacy 0x01-padding variant) is a software-
+                 * only mode; fall through to wolfCrypt's software path. */
+                if (sha != NULL &&
+                    (sha->flags & WC_HASH_SHA3_KECCAK256) != 0u) {
+                    ret = CRYPTOCB_UNAVAILABLE;
+                    break;
+                }
+#endif
+                switch (info->hash.type) {
+#ifndef WOLFSSL_NOSHA3_224
+                    case WC_HASH_TYPE_SHA3_224:
+                        ret = wh_Client_Sha3_224(ctx, sha, info->hash.in,
+                                                 info->hash.inSz,
+                                                 info->hash.digest);
+                        break;
+#endif
+#ifndef WOLFSSL_NOSHA3_256
+                    case WC_HASH_TYPE_SHA3_256:
+                        ret = wh_Client_Sha3_256(ctx, sha, info->hash.in,
+                                                 info->hash.inSz,
+                                                 info->hash.digest);
+                        break;
+#endif
+#ifndef WOLFSSL_NOSHA3_384
+                    case WC_HASH_TYPE_SHA3_384:
+                        ret = wh_Client_Sha3_384(ctx, sha, info->hash.in,
+                                                 info->hash.inSz,
+                                                 info->hash.digest);
+                        break;
+#endif
+#ifndef WOLFSSL_NOSHA3_512
+                    case WC_HASH_TYPE_SHA3_512:
+                        ret = wh_Client_Sha3_512(ctx, sha, info->hash.in,
+                                                 info->hash.inSz,
+                                                 info->hash.digest);
+                        break;
+#endif
+                }
+            } break;
+#endif /* WOLFSSL_SHA3 */
             default:
                 ret = CRYPTOCB_UNAVAILABLE;
                 break;
@@ -607,7 +789,447 @@ int wh_Client_CryptoCb(int devId, wc_CryptoInfo* info, void* inCtx)
     return ret;
 }
 
-#if defined(HAVE_FALCON) || defined(HAVE_DILITHIUM)
+#if defined(WOLFSSL_HAVE_MLKEM)
+static int _handlePqcKemKeyGen(whClientContext* ctx, wc_CryptoInfo* info,
+                               int useDma)
+{
+    int ret = CRYPTOCB_UNAVAILABLE;
+
+    /* Extract info parameters */
+    int   size = info->pk.pqc_kem_kg.size;
+    void* key  = info->pk.pqc_kem_kg.key;
+    int   type = info->pk.pqc_kem_kg.type;
+
+#ifndef WOLFHSM_CFG_DMA
+    if (useDma) {
+        /* DMA support not available - user passed wrong devId */
+        return WC_HW_E;
+    }
+#endif
+
+    (void)size;
+
+    switch (type) {
+        case WC_PQC_KEM_TYPE_KYBER: {
+            int level = ((MlKemKey*)key)->type;
+#ifdef WOLFHSM_CFG_DMA
+            if (useDma) {
+                ret = wh_Client_MlKemMakeExportKeyDma(ctx, level, key);
+            }
+            else
+#endif /* WOLFHSM_CFG_DMA */
+            {
+                ret = wh_Client_MlKemMakeExportKey(ctx, level, key);
+            }
+        } break;
+
+        default:
+            ret = CRYPTOCB_UNAVAILABLE;
+            break;
+    }
+
+    if (ret == WH_ERROR_BADARGS) {
+        ret = BAD_FUNC_ARG;
+    }
+    else if (ret == WH_ERROR_NOTIMPL) {
+        ret = CRYPTOCB_UNAVAILABLE;
+    }
+
+    return ret;
+}
+
+static int _handlePqcEncaps(whClientContext* ctx, wc_CryptoInfo* info,
+                            int useDma)
+{
+    int ret = CRYPTOCB_UNAVAILABLE;
+
+    /* Extract info parameters */
+    byte*  ciphertext    = info->pk.pqc_encaps.ciphertext;
+    word32 ciphertextLen = info->pk.pqc_encaps.ciphertextLen;
+    byte*  sharedSecret  = info->pk.pqc_encaps.sharedSecret;
+    word32 sharedSecLen  = info->pk.pqc_encaps.sharedSecretLen;
+    void*  key           = info->pk.pqc_encaps.key;
+    int    type          = info->pk.pqc_encaps.type;
+
+#ifndef WOLFHSM_CFG_DMA
+    if (useDma) {
+        /* DMA support not available - user passed wrong devId */
+        return WC_HW_E;
+    }
+#endif
+
+    switch (type) {
+        case WC_PQC_KEM_TYPE_KYBER:
+#ifdef WOLFHSM_CFG_DMA
+            if (useDma) {
+                ret = wh_Client_MlKemEncapsulateDma(ctx, key, ciphertext,
+                                                    &ciphertextLen,
+                                                    sharedSecret, &sharedSecLen);
+            }
+            else
+#endif /* WOLFHSM_CFG_DMA */
+            {
+                ret = wh_Client_MlKemEncapsulate(ctx, key, ciphertext,
+                                                 &ciphertextLen, sharedSecret,
+                                                 &sharedSecLen);
+            }
+            if (ret == WH_ERROR_OK) {
+                info->pk.pqc_encaps.ciphertextLen = ciphertextLen;
+                info->pk.pqc_encaps.sharedSecretLen = sharedSecLen;
+            }
+            break;
+
+        default:
+            ret = CRYPTOCB_UNAVAILABLE;
+            break;
+    }
+
+    if (ret == WH_ERROR_BADARGS) {
+        ret = BAD_FUNC_ARG;
+    }
+    else if (ret == WH_ERROR_NOTIMPL) {
+        ret = CRYPTOCB_UNAVAILABLE;
+    }
+
+    return ret;
+}
+
+static int _handlePqcDecaps(whClientContext* ctx, wc_CryptoInfo* info,
+                            int useDma)
+{
+    int ret = CRYPTOCB_UNAVAILABLE;
+
+    /* Extract info parameters */
+    const byte* ciphertext    = info->pk.pqc_decaps.ciphertext;
+    word32      ciphertextLen = info->pk.pqc_decaps.ciphertextLen;
+    byte*       sharedSecret  = info->pk.pqc_decaps.sharedSecret;
+    word32      sharedSecLen  = info->pk.pqc_decaps.sharedSecretLen;
+    void*       key           = info->pk.pqc_decaps.key;
+    int         type          = info->pk.pqc_decaps.type;
+
+#ifndef WOLFHSM_CFG_DMA
+    if (useDma) {
+        /* DMA support not available - user passed wrong devId */
+        return WC_HW_E;
+    }
+#endif
+
+    switch (type) {
+        case WC_PQC_KEM_TYPE_KYBER:
+#ifdef WOLFHSM_CFG_DMA
+            if (useDma) {
+                ret = wh_Client_MlKemDecapsulateDma(
+                    ctx, key, ciphertext, ciphertextLen, sharedSecret,
+                    &sharedSecLen);
+            }
+            else
+#endif /* WOLFHSM_CFG_DMA */
+            {
+                ret = wh_Client_MlKemDecapsulate(ctx, key, ciphertext,
+                                                 ciphertextLen, sharedSecret,
+                                                 &sharedSecLen);
+            }
+            if (ret == WH_ERROR_OK) {
+                info->pk.pqc_decaps.sharedSecretLen = sharedSecLen;
+            }
+            break;
+
+        default:
+            ret = CRYPTOCB_UNAVAILABLE;
+            break;
+    }
+
+    if (ret == WH_ERROR_BADARGS) {
+        ret = BAD_FUNC_ARG;
+    }
+    else if (ret == WH_ERROR_NOTIMPL) {
+        ret = CRYPTOCB_UNAVAILABLE;
+    }
+
+    return ret;
+}
+#endif /* WOLFSSL_HAVE_MLKEM */
+
+#if defined(WOLFSSL_HAVE_LMS) || defined(WOLFSSL_HAVE_XMSS)
+static int _handlePqcStatefulSigKeyGen(whClientContext* ctx,
+                                       wc_CryptoInfo* info, int useDma)
+{
+    int ret = CRYPTOCB_UNAVAILABLE;
+    int type = info->pk.pqc_stateful_sig_kg.type;
+
+    /* Unused when all enabled algorithms are verify-only (no keygen path). */
+    (void)ctx;
+    (void)useDma;
+
+#ifndef WOLFHSM_CFG_DMA
+    if (useDma) {
+        return WC_HW_E;
+    }
+#endif
+
+    switch (type) {
+#if defined(WOLFSSL_HAVE_LMS) && !defined(WOLFSSL_LMS_VERIFY_ONLY)
+        case WC_PQC_STATEFUL_SIG_TYPE_LMS:
+#ifdef WOLFHSM_CFG_DMA
+            if (useDma) {
+                ret = wh_Client_LmsMakeExportKeyDma(
+                    ctx, (LmsKey*)info->pk.pqc_stateful_sig_kg.key);
+            }
+            else
+#endif /* WOLFHSM_CFG_DMA */
+            {
+                /* Non-DMA transport not supported in v1; signatures exceed the
+                 * default WOLFHSM_CFG_COMM_DATA_LEN. */
+                ret = CRYPTOCB_UNAVAILABLE;
+            }
+            break;
+#endif /* WOLFSSL_HAVE_LMS && !WOLFSSL_LMS_VERIFY_ONLY */
+#if defined(WOLFSSL_HAVE_XMSS) && !defined(WOLFSSL_XMSS_VERIFY_ONLY)
+        case WC_PQC_STATEFUL_SIG_TYPE_XMSS:
+#ifdef WOLFHSM_CFG_DMA
+            if (useDma) {
+                ret = wh_Client_XmssMakeExportKeyDma(
+                    ctx, (XmssKey*)info->pk.pqc_stateful_sig_kg.key);
+            }
+            else
+#endif /* WOLFHSM_CFG_DMA */
+            {
+                ret = CRYPTOCB_UNAVAILABLE;
+            }
+            break;
+#endif /* WOLFSSL_HAVE_XMSS && !WOLFSSL_XMSS_VERIFY_ONLY */
+
+        default:
+            ret = CRYPTOCB_UNAVAILABLE;
+            break;
+    }
+
+    if (ret == WH_ERROR_BADARGS) {
+        ret = BAD_FUNC_ARG;
+    }
+    else if (ret == WH_ERROR_NOTIMPL) {
+        ret = CRYPTOCB_UNAVAILABLE;
+    }
+
+    return ret;
+}
+
+static int _handlePqcStatefulSigSign(whClientContext* ctx, wc_CryptoInfo* info,
+                                     int useDma)
+{
+    int ret  = CRYPTOCB_UNAVAILABLE;
+    int type = info->pk.pqc_stateful_sig_sign.type;
+
+    /* Unused when all enabled algorithms are verify-only (no sign path). */
+    (void)ctx;
+    (void)useDma;
+
+#ifndef WOLFHSM_CFG_DMA
+    if (useDma) {
+        return WC_HW_E;
+    }
+#endif
+
+    switch (type) {
+#if defined(WOLFSSL_HAVE_LMS) && !defined(WOLFSSL_LMS_VERIFY_ONLY)
+        case WC_PQC_STATEFUL_SIG_TYPE_LMS:
+#ifdef WOLFHSM_CFG_DMA
+            if (useDma) {
+                ret = wh_Client_LmsSignDma(
+                    ctx,
+                    info->pk.pqc_stateful_sig_sign.msg,
+                    info->pk.pqc_stateful_sig_sign.msgSz,
+                    info->pk.pqc_stateful_sig_sign.out,
+                    info->pk.pqc_stateful_sig_sign.outSz,
+                    (LmsKey*)info->pk.pqc_stateful_sig_sign.key);
+            }
+            else
+#endif /* WOLFHSM_CFG_DMA */
+            {
+                ret = CRYPTOCB_UNAVAILABLE;
+            }
+            break;
+#endif /* WOLFSSL_HAVE_LMS && !WOLFSSL_LMS_VERIFY_ONLY */
+#if defined(WOLFSSL_HAVE_XMSS) && !defined(WOLFSSL_XMSS_VERIFY_ONLY)
+        case WC_PQC_STATEFUL_SIG_TYPE_XMSS:
+#ifdef WOLFHSM_CFG_DMA
+            if (useDma) {
+                ret = wh_Client_XmssSignDma(
+                    ctx,
+                    info->pk.pqc_stateful_sig_sign.msg,
+                    info->pk.pqc_stateful_sig_sign.msgSz,
+                    info->pk.pqc_stateful_sig_sign.out,
+                    info->pk.pqc_stateful_sig_sign.outSz,
+                    (XmssKey*)info->pk.pqc_stateful_sig_sign.key);
+            }
+            else
+#endif /* WOLFHSM_CFG_DMA */
+            {
+                ret = CRYPTOCB_UNAVAILABLE;
+            }
+            break;
+#endif /* WOLFSSL_HAVE_XMSS && !WOLFSSL_XMSS_VERIFY_ONLY */
+
+        default:
+            ret = CRYPTOCB_UNAVAILABLE;
+            break;
+    }
+
+    if (ret == WH_ERROR_BADARGS) {
+        ret = BAD_FUNC_ARG;
+    }
+    else if (ret == WH_ERROR_NOTIMPL) {
+        ret = CRYPTOCB_UNAVAILABLE;
+    }
+
+    return ret;
+}
+
+static int _handlePqcStatefulSigVerify(whClientContext* ctx,
+                                       wc_CryptoInfo* info, int useDma)
+{
+    int ret  = CRYPTOCB_UNAVAILABLE;
+    int type = info->pk.pqc_stateful_sig_verify.type;
+
+#ifndef WOLFHSM_CFG_DMA
+    (void)ctx;
+    if (useDma) {
+        return WC_HW_E;
+    }
+#endif
+
+    switch (type) {
+#ifdef WOLFSSL_HAVE_LMS
+        case WC_PQC_STATEFUL_SIG_TYPE_LMS:
+#ifdef WOLFHSM_CFG_DMA
+            if (useDma) {
+                ret = wh_Client_LmsVerifyDma(
+                    ctx,
+                    info->pk.pqc_stateful_sig_verify.sig,
+                    info->pk.pqc_stateful_sig_verify.sigSz,
+                    info->pk.pqc_stateful_sig_verify.msg,
+                    info->pk.pqc_stateful_sig_verify.msgSz,
+                    info->pk.pqc_stateful_sig_verify.res,
+                    (LmsKey*)info->pk.pqc_stateful_sig_verify.key);
+            }
+            else
+#endif /* WOLFHSM_CFG_DMA */
+            {
+                ret = CRYPTOCB_UNAVAILABLE;
+            }
+            break;
+#endif /* WOLFSSL_HAVE_LMS */
+#ifdef WOLFSSL_HAVE_XMSS
+        case WC_PQC_STATEFUL_SIG_TYPE_XMSS:
+#ifdef WOLFHSM_CFG_DMA
+            if (useDma) {
+                ret = wh_Client_XmssVerifyDma(
+                    ctx,
+                    info->pk.pqc_stateful_sig_verify.sig,
+                    info->pk.pqc_stateful_sig_verify.sigSz,
+                    info->pk.pqc_stateful_sig_verify.msg,
+                    info->pk.pqc_stateful_sig_verify.msgSz,
+                    info->pk.pqc_stateful_sig_verify.res,
+                    (XmssKey*)info->pk.pqc_stateful_sig_verify.key);
+            }
+            else
+#endif /* WOLFHSM_CFG_DMA */
+            {
+                ret = CRYPTOCB_UNAVAILABLE;
+            }
+            break;
+#endif /* WOLFSSL_HAVE_XMSS */
+
+        default:
+            ret = CRYPTOCB_UNAVAILABLE;
+            break;
+    }
+
+    if (ret == WH_ERROR_BADARGS) {
+        ret = BAD_FUNC_ARG;
+    }
+    else if (ret == WH_ERROR_NOTIMPL) {
+        ret = CRYPTOCB_UNAVAILABLE;
+    }
+
+    return ret;
+}
+
+static int _handlePqcStatefulSigSigsLeft(whClientContext* ctx,
+                                         wc_CryptoInfo* info, int useDma)
+{
+    int ret  = CRYPTOCB_UNAVAILABLE;
+    int type = info->pk.pqc_stateful_sig_sigs_left.type;
+
+    /* Unused when all enabled algorithms are verify-only (no sigsLeft path). */
+    (void)ctx;
+    (void)useDma;
+
+#ifndef WOLFHSM_CFG_DMA
+    if (useDma) {
+        return WC_HW_E;
+    }
+#endif
+
+    switch (type) {
+#if defined(WOLFSSL_HAVE_LMS) && !defined(WOLFSSL_LMS_VERIFY_ONLY)
+        case WC_PQC_STATEFUL_SIG_TYPE_LMS:
+#ifdef WOLFHSM_CFG_DMA
+            if (useDma) {
+                /* ret is the error code if negative, otherwise a boolean */
+                ret = wh_Client_LmsSigsLeftDma(
+                    ctx, (LmsKey*)info->pk.pqc_stateful_sig_sigs_left.key);
+                if (ret >= 0) {
+                    *(info->pk.pqc_stateful_sig_sigs_left.sigsLeft) =
+                        (word32)ret;
+                    ret = WH_ERROR_OK;
+                }
+            }
+            else
+#endif /* WOLFHSM_CFG_DMA */
+            {
+                ret = CRYPTOCB_UNAVAILABLE;
+            }
+            break;
+#endif /* WOLFSSL_HAVE_LMS && !WOLFSSL_LMS_VERIFY_ONLY */
+#if defined(WOLFSSL_HAVE_XMSS) && !defined(WOLFSSL_XMSS_VERIFY_ONLY)
+        case WC_PQC_STATEFUL_SIG_TYPE_XMSS:
+#ifdef WOLFHSM_CFG_DMA
+            if (useDma) {
+                /* ret is the error code if negative, otherwise a boolean */
+                ret = wh_Client_XmssSigsLeftDma(
+                    ctx, (XmssKey*)info->pk.pqc_stateful_sig_sigs_left.key);
+                if (ret >= 0) {
+                    *(info->pk.pqc_stateful_sig_sigs_left.sigsLeft) =
+                        (word32)ret;
+                    ret = WH_ERROR_OK;
+                }
+            }
+            else
+#endif /* WOLFHSM_CFG_DMA */
+            {
+                ret = CRYPTOCB_UNAVAILABLE;
+            }
+            break;
+#endif /* WOLFSSL_HAVE_XMSS && !WOLFSSL_XMSS_VERIFY_ONLY */
+
+        default:
+            ret = CRYPTOCB_UNAVAILABLE;
+            break;
+    }
+
+    if (ret == WH_ERROR_BADARGS) {
+        ret = BAD_FUNC_ARG;
+    }
+    else if (ret == WH_ERROR_NOTIMPL) {
+        ret = CRYPTOCB_UNAVAILABLE;
+    }
+
+    return ret;
+}
+#endif /* WOLFSSL_HAVE_LMS || WOLFSSL_HAVE_XMSS */
+
+#if defined(HAVE_FALCON) || defined(WOLFSSL_HAVE_MLDSA)
 static int _handlePqcSigKeyGen(whClientContext* ctx, wc_CryptoInfo* info,
                                int useDma)
 {
@@ -620,15 +1242,15 @@ static int _handlePqcSigKeyGen(whClientContext* ctx, wc_CryptoInfo* info,
 
 #ifndef WOLFHSM_CFG_DMA
     if (useDma) {
-        /* TODO: proper error code? */
+        /* DMA support not available - user passed wrong devId */
         return WC_HW_E;
     }
 #endif
 
     switch (type) {
-#ifdef HAVE_DILITHIUM
-        case WC_PQC_SIG_TYPE_DILITHIUM: {
-            int level = ((MlDsaKey*)key)->level;
+#ifdef WOLFSSL_HAVE_MLDSA
+        case WC_PQC_SIG_TYPE_MLDSA: {
+            int level = ((wc_MlDsaKey*)key)->level;
 #ifdef WOLFHSM_CFG_DMA
             if (useDma) {
                 ret = wh_Client_MlDsaMakeExportKeyDma(ctx, level, key);
@@ -639,7 +1261,7 @@ static int _handlePqcSigKeyGen(whClientContext* ctx, wc_CryptoInfo* info,
                 ret = wh_Client_MlDsaMakeExportKey(ctx, level, size, key);
             }
         } break;
-#endif /* HAVE_DILITHIUM */
+#endif /* WOLFSSL_HAVE_MLDSA */
 
         /* Support for additional PQC algorithms should be added here */
 
@@ -668,14 +1290,14 @@ static int _handlePqcSign(whClientContext* ctx, wc_CryptoInfo* info, int useDma)
 
 #ifndef WOLFHSM_CFG_DMA
     if (useDma) {
-        /* TODO: proper error code? */
+        /* DMA support not available - user passed wrong devId */
         return WC_HW_E;
     }
 #endif
 
     switch (type) {
-#ifdef HAVE_DILITHIUM
-        case WC_PQC_SIG_TYPE_DILITHIUM:
+#ifdef WOLFSSL_HAVE_MLDSA
+        case WC_PQC_SIG_TYPE_MLDSA:
 #ifdef WOLFHSM_CFG_DMA
             if (useDma) {
                 ret = wh_Client_MlDsaSignDma(ctx, in, in_len, out, out_len,
@@ -689,7 +1311,7 @@ static int _handlePqcSign(whClientContext* ctx, wc_CryptoInfo* info, int useDma)
                                              context, contextLen, preHashType);
             }
             break;
-#endif /* HAVE_DILITHIUM */
+#endif /* WOLFSSL_HAVE_MLDSA */
 
         /* Support for additional PQC algorithms should be added here */
 
@@ -720,14 +1342,14 @@ static int _handlePqcVerify(whClientContext* ctx, wc_CryptoInfo* info,
 
 #ifndef WOLFHSM_CFG_DMA
     if (useDma) {
-        /* TODO: proper error code? */
+        /* DMA support not available - user passed wrong devId */
         return WC_HW_E;
     }
 #endif
 
     switch (type) {
-#ifdef HAVE_DILITHIUM
-        case WC_PQC_SIG_TYPE_DILITHIUM:
+#ifdef WOLFSSL_HAVE_MLDSA
+        case WC_PQC_SIG_TYPE_MLDSA:
 #ifdef WOLFHSM_CFG_DMA
             if (useDma) {
                 ret = wh_Client_MlDsaVerifyDma(ctx, sig, sig_len, msg, msg_len,
@@ -742,7 +1364,7 @@ static int _handlePqcVerify(whClientContext* ctx, wc_CryptoInfo* info,
                                                preHashType);
             }
             break;
-#endif /* HAVE_DILITHIUM */
+#endif /* WOLFSSL_HAVE_MLDSA */
 
         /* Support for additional PQC algorithms should be added here */
 
@@ -767,14 +1389,14 @@ static int _handlePqcSigCheckPrivKey(whClientContext* ctx, wc_CryptoInfo* info,
 
 #ifndef WOLFHSM_CFG_DMA
     if (useDma) {
-        /* TODO: proper error code? */
+        /* DMA support not available - user passed wrong devId */
         return WC_HW_E;
     }
 #endif
 
     switch (type) {
-#ifdef HAVE_DILITHIUM
-        case WC_PQC_SIG_TYPE_DILITHIUM:
+#ifdef WOLFSSL_HAVE_MLDSA
+        case WC_PQC_SIG_TYPE_MLDSA:
 #ifdef WOLFHSM_CFG_DMA
             if (useDma) {
                 ret =
@@ -786,7 +1408,7 @@ static int _handlePqcSigCheckPrivKey(whClientContext* ctx, wc_CryptoInfo* info,
                 ret = wh_Client_MlDsaCheckPrivKey(ctx, key, pubKey, pubKeySz);
             }
             break;
-#endif /* HAVE_DILITHIUM */
+#endif /* WOLFSSL_HAVE_MLDSA */
 
             /* Support for additional PQC algorithms should be added here */
 
@@ -797,7 +1419,7 @@ static int _handlePqcSigCheckPrivKey(whClientContext* ctx, wc_CryptoInfo* info,
 
     return ret;
 }
-#endif /* HAVE_FALCON || HAVE_DILITHIUM */
+#endif /* HAVE_FALCON || WOLFSSL_HAVE_MLDSA */
 
 
 #ifdef WOLFHSM_CFG_DMA
@@ -862,6 +1484,51 @@ int wh_Client_CryptoCbDma(int devId, wc_CryptoInfo* info, void* inCtx)
                 ret = wh_Client_Sha512Dma(ctx, sha, in, inLen, out);
             } break;
 #endif /* WOLFSSL_SHA512 && defined(WOLFSSL_SHA512_HASHTYPE) */
+#if defined(WOLFSSL_SHA3)
+            case WC_HASH_TYPE_SHA3_224:
+            case WC_HASH_TYPE_SHA3_256:
+            case WC_HASH_TYPE_SHA3_384:
+            case WC_HASH_TYPE_SHA3_512: {
+                wc_Sha3* sha = info->hash.sha3;
+#ifdef WOLFSSL_HASH_FLAGS
+                if (sha != NULL &&
+                    (sha->flags & WC_HASH_SHA3_KECCAK256) != 0u) {
+                    ret = CRYPTOCB_UNAVAILABLE;
+                    break;
+                }
+#endif
+                switch (info->hash.type) {
+#ifndef WOLFSSL_NOSHA3_224
+                    case WC_HASH_TYPE_SHA3_224:
+                        ret = wh_Client_Sha3_224Dma(ctx, sha, info->hash.in,
+                                                    info->hash.inSz,
+                                                    info->hash.digest);
+                        break;
+#endif
+#ifndef WOLFSSL_NOSHA3_256
+                    case WC_HASH_TYPE_SHA3_256:
+                        ret = wh_Client_Sha3_256Dma(ctx, sha, info->hash.in,
+                                                    info->hash.inSz,
+                                                    info->hash.digest);
+                        break;
+#endif
+#ifndef WOLFSSL_NOSHA3_384
+                    case WC_HASH_TYPE_SHA3_384:
+                        ret = wh_Client_Sha3_384Dma(ctx, sha, info->hash.in,
+                                                    info->hash.inSz,
+                                                    info->hash.digest);
+                        break;
+#endif
+#ifndef WOLFSSL_NOSHA3_512
+                    case WC_HASH_TYPE_SHA3_512:
+                        ret = wh_Client_Sha3_512Dma(ctx, sha, info->hash.in,
+                                                    info->hash.inSz,
+                                                    info->hash.digest);
+                        break;
+#endif
+                }
+            } break;
+#endif /* WOLFSSL_SHA3 */
             default:
                 ret = CRYPTOCB_UNAVAILABLE;
                 break;
@@ -871,7 +1538,32 @@ int wh_Client_CryptoCbDma(int devId, wc_CryptoInfo* info, void* inCtx)
 
     case WC_ALGO_TYPE_PK: {
         switch (info->pk.type) {
-#if defined(HAVE_DILITHIUM) || defined(HAVE_FALCON)
+#if defined(WOLFSSL_HAVE_MLKEM)
+            case WC_PK_TYPE_PQC_KEM_KEYGEN:
+                ret = _handlePqcKemKeyGen(ctx, info, 1);
+                break;
+            case WC_PK_TYPE_PQC_KEM_ENCAPS:
+                ret = _handlePqcEncaps(ctx, info, 1);
+                break;
+            case WC_PK_TYPE_PQC_KEM_DECAPS:
+                ret = _handlePqcDecaps(ctx, info, 1);
+                break;
+#endif /* WOLFSSL_HAVE_MLKEM */
+#if defined(WOLFSSL_HAVE_LMS) || defined(WOLFSSL_HAVE_XMSS)
+            case WC_PK_TYPE_PQC_STATEFUL_SIG_KEYGEN:
+                ret = _handlePqcStatefulSigKeyGen(ctx, info, 1);
+                break;
+            case WC_PK_TYPE_PQC_STATEFUL_SIG_SIGN:
+                ret = _handlePqcStatefulSigSign(ctx, info, 1);
+                break;
+            case WC_PK_TYPE_PQC_STATEFUL_SIG_VERIFY:
+                ret = _handlePqcStatefulSigVerify(ctx, info, 1);
+                break;
+            case WC_PK_TYPE_PQC_STATEFUL_SIG_SIGS_LEFT:
+                ret = _handlePqcStatefulSigSigsLeft(ctx, info, 1);
+                break;
+#endif /* WOLFSSL_HAVE_LMS || WOLFSSL_HAVE_XMSS */
+#if defined(WOLFSSL_HAVE_MLDSA) || defined(HAVE_FALCON)
             case WC_PK_TYPE_PQC_SIG_KEYGEN:
                 ret = _handlePqcSigKeyGen(ctx, info, 1);
                 break;
@@ -884,7 +1576,7 @@ int wh_Client_CryptoCbDma(int devId, wc_CryptoInfo* info, void* inCtx)
             case WC_PK_TYPE_PQC_SIG_CHECK_PRIV_KEY:
                 ret = _handlePqcSigCheckPrivKey(ctx, info, 1);
                 break;
-#endif /* HAVE_DILITHIUM || HAVE_FALCON */
+#endif /* WOLFSSL_HAVE_MLDSA || HAVE_FALCON */
 #ifdef HAVE_ED25519
             case WC_PK_TYPE_ED25519_KEYGEN: {
                 ed25519_key* key = info->pk.ed25519kg.key;

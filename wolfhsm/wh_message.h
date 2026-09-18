@@ -72,6 +72,8 @@ enum WH_KEY_ENUM {
     WH_KEY_DATAUNWRAP,
     WH_KEY_EXPORT_PUBLIC,
     WH_KEY_EXPORT_PUBLIC_DMA,
+    WH_KEY_CACHE_RANDOM,
+    WH_KEY_KEYWRAPEXPORT,
 };
 
 /* SHE actions */
@@ -93,6 +95,7 @@ enum WH_SHE_ENUM {
     WH_SHE_DEC_CBC,
     WH_SHE_GEN_MAC,
     WH_SHE_VERIFY_MAC,
+    WH_SHE_GET_ID,
 };
 
 /* counter actions */

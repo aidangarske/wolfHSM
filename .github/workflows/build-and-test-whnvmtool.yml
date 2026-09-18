@@ -3,8 +3,16 @@ name: whnvmtool build and test
 on:
   push:
     branches: [ 'master', 'main', 'release/**' ]
+  schedule:
+    # Weekly ccache reseed; also keeps caches from 7-day eviction
+    - cron: '0 6 * * 1'
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
     branches: [ '*' ]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
@@ -12,7 +20,9 @@ permissions:
 jobs:
   build:
 
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.draft == false }}
     runs-on: ubuntu-latest
+    timeout-minutes: 10
 
     steps:
     - uses: actions/checkout@v4
@@ -32,6 +42,13 @@ jobs:
         repository: wolfssl/wolfssl
         path: wolfssl
 
+    # Compiler cache; PR runs restore without saving
+    - name: Set up ccache
+      uses: ./.github/actions/ccache-setup
+      with:
+        workflow-id: whnvmtool
+        read-only: ${{ github.event_name == 'pull_request' }}
+
     # Build and test standard build of whnvmtool
     - name: Build and test NVM tool
       run: cd tools/whnvmtool && make clean && make check WOLFSSL_DIR=../../wolfssl
@@ -39,6 +56,9 @@ jobs:
     # Build and test ASAN
     - name: Build and test NVM tool with ASAN
       run: cd tools/whnvmtool && make clean && make check WOLFSSL_DIR=../../wolfssl ASAN=1
+
+    - name: Build and test NVM tool with NVM flash CRC ASAN
+      run: cd tools/whnvmtool && make clean && make check WOLFSSL_DIR=../../wolfssl NVM_FLASH_CRC=1 ASAN=1
 
     # Build and test with DEBUG=1
     - name: Build and test NVM tool with DEBUG

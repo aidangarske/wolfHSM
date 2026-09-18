@@ -85,15 +85,24 @@ int wh_Server_Init(whServerContext* server, whServerConfig* config)
 
     memset(server, 0, sizeof(*server));
     server->nvm = config->nvm;
-#ifdef WOLFHSM_CFG_ENABLE_AUTHENTICATION
-    server->auth = config->auth;
-#endif /* WOLFHSM_CFG_ENABLE_AUTHENTICATION */
 
 #ifndef WOLFHSM_CFG_NO_CRYPTO
     server->crypto = config->crypto;
     server->devId  = config->devId;
 #ifdef WOLFHSM_CFG_SHE_EXTENSION
     server->she = config->she;
+    if (server->she != NULL) {
+        if (config->sheConfig != NULL) {
+            server->she->getUidCb = config->sheConfig->getUidCb;
+            server->she->setUidCb = config->sheConfig->setUidCb;
+            server->she->uidCtx   = config->sheConfig->uidCtx;
+        }
+        else {
+            server->she->getUidCb = NULL;
+            server->she->setUidCb = NULL;
+            server->she->uidCtx   = NULL;
+        }
+    }
 #endif
 #endif
 
@@ -106,6 +115,34 @@ int wh_Server_Init(whServerContext* server, whServerConfig* config)
         }
     }
 #endif /* WOLFHSM_CFG_LOGGING */
+
+#ifdef WOLFHSM_CFG_ENABLE_AUTHENTICATION
+    server->auth = config->auth;
+    /* auth context is externally owned; clear any stale session left over from
+     * a prior connection (Logout first so backend callback runs). */
+    if (server->auth != NULL) {
+        if (server->auth->user.user_id != WH_USER_ID_INVALID) {
+            whUserId stale_id = server->auth->user.user_id;
+
+            rc = wh_Auth_Logout(server->auth, stale_id);
+            if (rc != WH_ERROR_OK) {
+                WH_LOG(&server->log, WH_LOG_LEVEL_SECEVENT,
+                   "Stale auth session force-cleared during server init after "
+                   "logout failure");
+            }
+        }
+        rc = wh_Auth_Reset(server->auth);
+        if (rc != WH_ERROR_OK) {
+            WH_LOG(&server->log, WH_LOG_LEVEL_SECEVENT,
+                   "Failed to clear auth session during server init");
+            (void)wh_Server_Cleanup(server);
+            return rc;
+        }
+    }
+#endif /* WOLFHSM_CFG_ENABLE_AUTHENTICATION */
+#ifdef WOLFHSM_CFG_HWKEYSTORE
+    server->hwKeystore = config->hwKeystore;
+#endif /* WOLFHSM_CFG_HWKEYSTORE */
 
     rc = wh_CommServer_Init(server->comm, config->comm_config,
             wh_Server_SetConnectedCb, (void*)server);
@@ -121,6 +158,20 @@ int wh_Server_Init(whServerContext* server, whServerConfig* config)
         server->dma.cb               = config->dmaConfig->cb;
     }
 #endif /* WOLFHSM_CFG_DMA */
+
+#if defined(WOLFHSM_CFG_CERTIFICATE_MANAGER) && !defined(WOLFHSM_CFG_NO_CRYPTO)
+    /* Register the user-supplied verify callback, if any. The cache (if
+     * compiled in) is already zero-initialized by the memset above. */
+    if (config->certConfig != NULL) {
+        server->cert.verifyCb = config->certConfig->verifyCb;
+    }
+#if defined(WOLFHSM_CFG_CERTIFICATE_VERIFY_CACHE) && \
+    !defined(WOLFHSM_CFG_CERTIFICATE_VERIFY_CACHE_GLOBAL)
+    /* Cache defaults to enabled so a fresh server preserves pre-runtime-toggle
+     * behavior. Clients can disable via wh_Client_CertVerifyCacheSetEnabled. */
+    server->cert.cache.enabled = 1;
+#endif
+#endif /* WOLFHSM_CFG_CERTIFICATE_MANAGER && !WOLFHSM_CFG_NO_CRYPTO */
 
     /* Log the server startup */
     WH_LOG(&server->log, WH_LOG_LEVEL_INFO, "Server Initialized");
@@ -162,6 +213,30 @@ int wh_Server_SetConnected(whServerContext *server, whCommConnected connected)
     if (server == NULL) {
         return WH_ERROR_BADARGS;
     }
+
+#ifdef WOLFHSM_CFG_ENABLE_AUTHENTICATION
+    /* Log out any active user on disconnect, including abrupt drops where
+     * COMM_CLOSE never arrives. */
+    if (connected == WH_COMM_DISCONNECTED &&
+        server->auth != NULL &&
+        server->auth->user.user_id != WH_USER_ID_INVALID) {
+        whUserId user_id = server->auth->user.user_id;
+        int      rc      = wh_Auth_Logout(server->auth, user_id);
+
+        if (rc != WH_ERROR_OK) {
+            WH_LOG(&server->log, WH_LOG_LEVEL_SECEVENT,
+                   "Auth session force-cleared on disconnect after logout "
+                   "failure");
+        }
+        rc = wh_Auth_Reset(server->auth);
+        if (rc != WH_ERROR_OK) {
+            WH_LOG(&server->log, WH_LOG_LEVEL_SECEVENT,
+                   "Failed to clear auth session on disconnect");
+            server->connected = connected;
+            return rc;
+        }
+    }
+#endif /* WOLFHSM_CFG_ENABLE_AUTHENTICATION */
 
     server->connected = connected;
     return WH_ERROR_OK;
@@ -271,15 +346,9 @@ static int _wh_Server_HandleCommRequest(whServerContext* server,
         /* No message */
         /* Process the close action */
 
-#ifdef WOLFHSM_CFG_ENABLE_AUTHENTICATION
-        /* Log out the current user when communication channel closes */
-        if (server->auth != NULL &&
-            server->auth->user.user_id != WH_USER_ID_INVALID) {
-            whUserId user_id = server->auth->user.user_id;
-            (void)wh_Auth_Logout(server->auth, user_id);
-        }
-#endif /* WOLFHSM_CFG_ENABLE_AUTHENTICATION */
-
+        /* wh_Server_SetConnected logs out any active user on the transition to
+         * the disconnected state, so the graceful-close and abrupt-disconnect
+         * paths share a single authoritative logout. */
         wh_Server_SetConnected(server, WH_COMM_DISCONNECTED);
         *out_resp_size = 0;
 
@@ -340,9 +409,12 @@ static uint16_t _FormatAuthErrorResponse(uint16_t magic, uint16_t group,
     }
 
     /* Write error code to first int32_t (rc field) - all responses start with
-     * this */
-    *(int32_t*)resp_packet =
-        (int32_t)wh_Translate32(magic, (uint32_t)error_code);
+     * this. Use memcpy since resp_packet may be only byte-aligned. */
+    {
+        int32_t translated_rc =
+            (int32_t)wh_Translate32(magic, (uint32_t)error_code);
+        memcpy(resp_packet, &translated_rc, sizeof(translated_rc));
+    }
 
     switch (group) {
 #ifdef WOLFHSM_CFG_ENABLE_AUTHENTICATION
@@ -519,7 +591,7 @@ int wh_Server_HandleRequestMessage(whServerContext* server)
     }
 
     int rc = wh_CommServer_RecvRequest(server->comm, &magic, &kind, &seq,
-            &size, data);
+            &size, WOLFHSM_CFG_COMM_DATA_LEN, data);
     /* Got a packet? */
     if (rc == WH_ERROR_OK) {
         group = WH_MESSAGE_GROUP(kind);
@@ -698,16 +770,24 @@ int wh_Server_HandleRequestMessage(whServerContext* server)
 #ifdef WOLFHSM_CFG_THREADSAFE
 int wh_Server_NvmLock(whServerContext* server)
 {
-    if (server == NULL || server->nvm == NULL) {
+    if (server == NULL) {
         return WH_ERROR_BADARGS;
+    }
+    /* NVM is optional. With no NVM there's no shared state to protect, so the
+     * lock is a no-op and cache-only operations can still run. */
+    if (server->nvm == NULL) {
+        return WH_ERROR_OK;
     }
     return wh_Lock_Acquire(&server->nvm->lock);
 }
 
 int wh_Server_NvmUnlock(whServerContext* server)
 {
-    if (server == NULL || server->nvm == NULL) {
+    if (server == NULL) {
         return WH_ERROR_BADARGS;
+    }
+    if (server->nvm == NULL) {
+        return WH_ERROR_OK;
     }
     return wh_Lock_Release(&server->nvm->lock);
 }
