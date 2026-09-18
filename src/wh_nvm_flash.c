@@ -46,7 +46,7 @@ enum {
 /* MSW of state variables (nfState) must be set to this pattern when written
  * to flash to prevent hardware on certain chipsets from confusing zero values
  * with erased flash */
-static const whFlashUnit BASE_STATE = 0x1234567800000000ULL;
+#define BASE_STATE 0x1234567800000000ULL
 
 #ifdef WOLFHSM_CFG_NVM_FLASH_CRC16
 /* With CRC16 enabled, the object start and count state words carry a CRC in
@@ -56,9 +56,10 @@ static const whFlashUnit BASE_STATE = 0x1234567800000000ULL;
  * The epoch word and all partition state words keep the full BASE_STATE
  * magic. The remaining 0x12/0x34 bytes still keep every state word distinct
  * from erased flash. */
-static const whFlashUnit CRC_BASE_STATE = 0x1234000000000000ULL;
-#define NF_STATE_CRC_PACK(_crc) (((whFlashUnit)(uint16_t)(_crc)) << 32)
-#define NF_STATE_CRC_EXTRACT(_unit) ((uint16_t)(((_unit) >> 32) & 0xFFFFULL))
+#define CRC_BASE_STATE 0x1234000000000000ULL
+#define NF_STATE_CRC_PACK(_crc) (((uint64_t)(uint16_t)(_crc)) << 32)
+#define NF_STATE_CRC_EXTRACT(_unit) \
+    ((uint16_t)((WHFU_TO_U64(_unit) >> 32) & 0xFFFFULL))
 #endif
 
 /* On-flash layout of the state of an Object or Directory*/
@@ -221,9 +222,9 @@ static int nfMemState_Read(whNvmFlashContext* context, uint32_t offset,
             return ret;
         }
 
-        state->epoch = buffer.epoch;
-        state->start = buffer.start;
-        state->count = buffer.count;
+        state->epoch = (uint32_t)WHFU_TO_U64(buffer.epoch);
+        state->start = (uint32_t)WHFU_TO_U64(buffer.start);
+        state->count = (uint32_t)WHFU_TO_U64(buffer.count);
 #ifdef WOLFHSM_CFG_NVM_FLASH_CRC16
         state->crc_meta = NF_STATE_CRC_EXTRACT(buffer.start);
         state->crc_data = NF_STATE_CRC_EXTRACT(buffer.count);
@@ -242,8 +243,8 @@ static int nfMemState_Read(whNvmFlashContext* context, uint32_t offset,
             return ret;
         }
 
-        state->epoch = buffer.epoch;
-        state->start = buffer.start;
+        state->epoch = (uint32_t)WHFU_TO_U64(buffer.epoch);
+        state->start = (uint32_t)WHFU_TO_U64(buffer.start);
 #ifdef WOLFHSM_CFG_NVM_FLASH_CRC16
         state->crc_meta = NF_STATE_CRC_EXTRACT(buffer.start);
 #endif
@@ -441,7 +442,7 @@ static int nfPartition_ReadParseMemDirectory(whNvmFlashContext* context, int par
 static int nfPartition_ProgramEpoch(whNvmFlashContext* context,
         int partition, uint32_t epoch)
 {
-    whFlashUnit unit = BASE_STATE | epoch;
+    whFlashUnit unit = WHFU_VALUE(BASE_STATE | epoch);
 
     if ((context == NULL) || (context->cb == NULL)) {
         return WH_ERROR_BADARGS;
@@ -459,7 +460,7 @@ static int nfPartition_ProgramEpoch(whNvmFlashContext* context,
 static int nfPartition_ProgramStart(whNvmFlashContext* context,
         int partition, uint32_t start)
 {
-    whFlashUnit unit = BASE_STATE | start;
+    whFlashUnit unit = WHFU_VALUE(BASE_STATE | start);
 
     if ((context == NULL) || (context->cb == NULL)) {
         return WH_ERROR_BADARGS;
@@ -477,7 +478,7 @@ static int nfPartition_ProgramStart(whNvmFlashContext* context,
 static int nfPartition_ProgramCount(whNvmFlashContext* context,
         int partition, uint32_t count)
 {
-    whFlashUnit unit = BASE_STATE | count;
+    whFlashUnit unit = WHFU_VALUE(BASE_STATE | count);
 
     if ((context == NULL) || (context->cb == NULL)) {
         return WH_ERROR_BADARGS;
@@ -588,8 +589,8 @@ static int nfObject_ProgramBegin(whNvmFlashContext* context, int partition,
 {
     int rc = 0;
     uint32_t object_offset = 0;
-    whFlashUnit state_epoch = BASE_STATE | epoch;
-    whFlashUnit state_start = BASE_STATE | start;
+    whFlashUnit state_epoch = WHFU_VALUE(BASE_STATE | epoch);
+    whFlashUnit state_start = WHFU_VALUE(BASE_STATE | start);
 
     if (    (context == NULL) ||
             (context->cb == NULL) ||
@@ -599,7 +600,8 @@ static int nfObject_ProgramBegin(whNvmFlashContext* context, int partition,
 
 #ifdef WOLFHSM_CFG_NVM_FLASH_CRC16
     /* Start word carries the metadata CRC in place of the low magic half */
-    state_start = CRC_BASE_STATE | NF_STATE_CRC_PACK(crc_meta) | start;
+    state_start = WHFU_VALUE(CRC_BASE_STATE | NF_STATE_CRC_PACK(crc_meta) |
+                             start);
 #else
     (void)crc_meta;
 #endif
@@ -672,7 +674,8 @@ static int nfObject_ProgramFinish(whNvmFlashContext* context, int partition,
 {
     int rc;
     uint32_t object_offset = 0;
-    whFlashUnit state_count = BASE_STATE | WHFU_BYTES2UNITS(byte_count);
+    whFlashUnit state_count = WHFU_VALUE(BASE_STATE |
+        WHFU_BYTES2UNITS(byte_count));
 
     if ((context == NULL) || (context->cb == NULL)) {
         return WH_ERROR_BADARGS;
@@ -680,8 +683,8 @@ static int nfObject_ProgramFinish(whNvmFlashContext* context, int partition,
 
 #ifdef WOLFHSM_CFG_NVM_FLASH_CRC16
     /* Count word carries the data CRC in place of the low magic half */
-    state_count = CRC_BASE_STATE | NF_STATE_CRC_PACK(crc_data) |
-                  WHFU_BYTES2UNITS(byte_count);
+    state_count = WHFU_VALUE(CRC_BASE_STATE | NF_STATE_CRC_PACK(crc_data) |
+                             WHFU_BYTES2UNITS(byte_count));
 #else
     (void)crc_data;
 #endif
@@ -1012,13 +1015,12 @@ static int nfIdList_Contains(whNvmId list_count, const whNvmId* id_list,
 
 int wh_NvmFlash_Init(void* c, const void* cf)
 {
-    whNvmFlashContext* context = c;
-    const whNvmFlashConfig* config = cf;
-    int                     ret     = WH_ERROR_OK;
+    whNvmFlashContext*      context        = c;
+    const whNvmFlashConfig* config         = cf;
+    uint32_t                partition_size = 0;
+    int                     ret            = WH_ERROR_OK;
 
-    if (    (context == NULL) ||
-            (config == NULL) ||
-            (config->cb == NULL)) {
+    if ((context == NULL) || (config == NULL) || (config->cb == NULL)) {
         return WH_ERROR_BADARGS;
     }
 
@@ -1028,14 +1030,30 @@ int wh_NvmFlash_Init(void* c, const void* cf)
     if (ret == WH_ERROR_OK) {
         /* Initialize and setup context */
         memset(context, 0, sizeof(*context));
-        context->cb = config->cb;
+        context->cb    = config->cb;
         context->flash = config->context;
 
         /* Get partition size from flash device */
-        if (context->cb->PartitionSize != NULL) {
-            context->partition_units =
-                    context->cb->PartitionSize(context->flash) /
-                    WHFU_BYTES_PER_UNIT;
+        if (context->cb->PartitionSize == NULL) {
+            ret = WH_ERROR_BADARGS;
+        }
+        else {
+            partition_size = context->cb->PartitionSize(context->flash);
+            if (((partition_size % WHFU_BYTES_PER_UNIT) != 0) ||
+                ((partition_size / WHFU_BYTES_PER_UNIT) <
+                 NF_PARTITION_DATA_OFFSET)) {
+                ret = WH_ERROR_BADARGS;
+            }
+            else {
+                context->partition_units = partition_size / WHFU_BYTES_PER_UNIT;
+            }
+        }
+
+        if (ret != WH_ERROR_OK) {
+            if (context->cb->Cleanup != NULL) {
+                (void)context->cb->Cleanup(context->flash);
+            }
+            return ret;
         }
 
         /* Unlock the both partitions */
@@ -1051,22 +1069,25 @@ int wh_NvmFlash_Init(void* c, const void* cf)
         (void)nfPartition_ReadMemState(context, 1, &part_states[1]);
 
         /* Decide which directory should be active */
-        if (        (part_states[0].status == NF_STATUS_USED) &&
-                    (part_states[1].status != NF_STATUS_USED)) {
+        if ((part_states[0].status == NF_STATUS_USED) &&
+            (part_states[1].status != NF_STATUS_USED)) {
             context->active = 0;
             context->state = part_states[context->active];
-        } else if ( (part_states[0].status != NF_STATUS_USED) &&
-                    (part_states[1].status == NF_STATUS_USED)) {
+        }
+        else if ((part_states[0].status != NF_STATUS_USED) &&
+                 (part_states[1].status == NF_STATUS_USED)) {
             context->active = 1;
             context->state = part_states[context->active];
-        } else if ( (part_states[0].status == NF_STATUS_USED) &&
-                    (part_states[1].status == NF_STATUS_USED)) {
+        }
+        else if ((part_states[0].status == NF_STATUS_USED) &&
+                 (part_states[1].status == NF_STATUS_USED)) {
             /* Check which has larger epoch */
             context->active =
                     (part_states[1].epoch > part_states[0].epoch);
             context->state = part_states[context->active];
-        } else if ( (part_states[0].status == NF_STATUS_FREE) &&
-                    (part_states[1].status == NF_STATUS_FREE)) {
+        }
+        else if ((part_states[0].status == NF_STATUS_FREE) &&
+                 (part_states[1].status == NF_STATUS_FREE)) {
             /* Both are blank.  Set active to 0 and initialize */
             context->active = 0;
             ret             = nfPartition_ProgramInit(context, context->active);

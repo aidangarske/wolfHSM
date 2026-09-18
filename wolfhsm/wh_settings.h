@@ -101,6 +101,11 @@
  *  WOLFHSM_CFG_NVM_OBJECT_COUNT - Number of objects in ram and disk directories
  *      Default: 32
  *
+ *  WOLFHSM_CFG_FLASH_UNIT_SIZE - Smallest programmable flash unit in bytes.
+ *  Supported values are 8 and 16. This changes the on-flash format and must
+ *  match whnvmtool. Changing it requires erasing or migrating existing NVM.
+ *      Default: 8
+ *
  *  WOLFHSM_CFG_NVM_FLASH_CRC16 - If defined, the nvm_flash backend stores a
  *  CRC16 of each object's metadata and data in the on-flash object state and
  *  verifies them: metadata when the directory is loaded, data on full-object
