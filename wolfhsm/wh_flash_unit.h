@@ -79,7 +79,7 @@ typedef union whFlashUnit_t {
 #undef WHFU_ALIGN8
 
 #define WHFU_BYTES_PER_UNIT sizeof(whFlashUnit)
-#define WHFU_TO_U64(_unit) ((_unit).u64[0])
+/* Reject unsupported layouts at compile time. */
 
 struct whFlashUnitAlignmentCheck {
     uint8_t     byte;
