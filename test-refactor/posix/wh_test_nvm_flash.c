@@ -43,7 +43,7 @@
 
 #define NVM_FLASH_SIZE       (1024 * 1024)
 #define NVM_FLASH_SECTOR_SZ  (4096)
-#define NVM_FLASH_PAGE_SZ    (8)
+#define NVM_FLASH_PAGE_SZ    WHFU_BYTES_PER_UNIT
 
 
 /*
@@ -118,6 +118,8 @@ int whTest_FlashUnitOps(void* ctx)
     (void)ctx;
     _setup();
 
+    WH_TEST_ASSERT_RETURN(WHFU_BYTES_PER_UNIT ==
+                          WOLFHSM_CFG_FLASH_UNIT_SIZE);
     WH_TEST_RETURN_ON_FAIL(
         c->flashCb.Init(&c->flashCtx, &c->flashCfg));
 
@@ -186,10 +188,29 @@ int whTest_FlashUnitOps(void* ctx)
         WH_TEST_RETURN_ON_FAIL(
             wh_FlashUnit_ReadBytes(
                 &c->flashCb, &c->flashCtx,
-                base * WHFU_BYTES_PER_UNIT + 2,
-                21, readback));
+                base * WHFU_BYTES_PER_UNIT + 1,
+                10, readback));
         WH_TEST_ASSERT_RETURN(
-            0 == memcmp(readback, &pattern[2], 21));
+            0 == memcmp(readback, &pattern[1], 10));
+
+        memset(readback, 0, sizeof(readback));
+        WH_TEST_RETURN_ON_FAIL(
+            wh_FlashUnit_ReadBytes(
+                &c->flashCb, &c->flashCtx,
+                base * WHFU_BYTES_PER_UNIT + 5,
+                3, readback));
+        WH_TEST_ASSERT_RETURN(
+            0 == memcmp(readback, &pattern[5], 3));
+
+        memset(readback, 0, sizeof(readback));
+        WH_TEST_RETURN_ON_FAIL(
+            wh_FlashUnit_ReadBytes(
+                &c->flashCb, &c->flashCtx,
+                base * WHFU_BYTES_PER_UNIT + 2,
+                2 * WHFU_BYTES_PER_UNIT + 5, readback));
+        WH_TEST_ASSERT_RETURN(
+            0 == memcmp(readback, &pattern[2],
+                        2 * WHFU_BYTES_PER_UNIT + 5));
     }
 
     /* Erase + lock */
@@ -202,6 +223,152 @@ int whTest_FlashUnitOps(void* ctx)
 
     WH_TEST_RETURN_ON_FAIL(
         c->flashCb.Cleanup(&c->flashCtx));
+
+    return 0;
+}
+
+
+typedef struct {
+    uint32_t partitionSize;
+    int      cleanupCount;
+    int      accessCount;
+} whTestNvmGeometryCtx;
+
+
+static int _geometryInit(void* context, const void* config)
+{
+    whTestNvmGeometryCtx* c = context;
+
+    c->partitionSize = *(const uint32_t*)config;
+    c->cleanupCount  = 0;
+    c->accessCount   = 0;
+    return WH_ERROR_OK;
+}
+
+
+static int _geometryCleanup(void* context)
+{
+    whTestNvmGeometryCtx* c = context;
+
+    c->cleanupCount++;
+    return WH_ERROR_OK;
+}
+
+
+static uint32_t _geometryPartitionSize(void* context)
+{
+    whTestNvmGeometryCtx* c = context;
+
+    return c->partitionSize;
+}
+
+
+static int _geometryWriteUnlock(void* context, uint32_t offset, uint32_t size)
+{
+    whTestNvmGeometryCtx* c = context;
+
+    (void)offset;
+    (void)size;
+    c->accessCount++;
+    return WH_ERROR_OK;
+}
+
+
+static int _geometryBlankCheck(void* context, uint32_t offset, uint32_t size)
+{
+    whTestNvmGeometryCtx* c = context;
+
+    (void)offset;
+    (void)size;
+    c->accessCount++;
+    return WH_ERROR_ABORTED;
+}
+
+
+int whTest_NvmInvalidGeometry(void* ctx)
+{
+    const uint32_t       alignedTooSmall = WHFU_BYTES_PER_UNIT;
+    const uint32_t       misalignedLarge = NVM_FLASH_SECTOR_SZ + 1;
+    const uint32_t       validSize       = NVM_FLASH_SECTOR_SZ;
+    whFlashCb            flashCb[1]      = {{
+                    .Init          = _geometryInit,
+                    .Cleanup       = _geometryCleanup,
+                    .PartitionSize = _geometryPartitionSize,
+                    .WriteUnlock   = _geometryWriteUnlock,
+                    .BlankCheck    = _geometryBlankCheck,
+    }};
+    whTestNvmGeometryCtx flashCtx[1]     = {0};
+    whNvmFlashConfig     nvmCfg[1]       = {{
+                  .cb      = flashCb,
+                  .context = flashCtx,
+                  .config  = &alignedTooSmall,
+    }};
+    whNvmFlashContext    nvmCtx[1]       = {0};
+
+    (void)ctx;
+
+    WH_TEST_ASSERT_RETURN(WH_ERROR_BADARGS ==
+                          wh_NvmFlash_Init(nvmCtx, nvmCfg));
+    WH_TEST_ASSERT_RETURN(1 == flashCtx->cleanupCount);
+    WH_TEST_ASSERT_RETURN(0 == flashCtx->accessCount);
+    WH_TEST_ASSERT_RETURN(WH_ERROR_OK == wh_NvmFlash_Cleanup(nvmCtx));
+    WH_TEST_ASSERT_RETURN(1 == flashCtx->cleanupCount);
+
+    nvmCfg->config = &misalignedLarge;
+    WH_TEST_ASSERT_RETURN(WH_ERROR_BADARGS ==
+                          wh_NvmFlash_Init(nvmCtx, nvmCfg));
+    WH_TEST_ASSERT_RETURN(1 == flashCtx->cleanupCount);
+    WH_TEST_ASSERT_RETURN(0 == flashCtx->accessCount);
+    WH_TEST_ASSERT_RETURN(WH_ERROR_OK == wh_NvmFlash_Cleanup(nvmCtx));
+    WH_TEST_ASSERT_RETURN(1 == flashCtx->cleanupCount);
+
+    nvmCfg->config = &validSize;
+    WH_TEST_ASSERT_RETURN(WH_ERROR_ABORTED ==
+                          wh_NvmFlash_Init(nvmCtx, nvmCfg));
+    WH_TEST_ASSERT_RETURN(1 == flashCtx->cleanupCount);
+    WH_TEST_ASSERT_RETURN(5 == flashCtx->accessCount);
+    WH_TEST_ASSERT_RETURN(WH_ERROR_OK == wh_NvmFlash_Cleanup(nvmCtx));
+    WH_TEST_ASSERT_RETURN(1 == flashCtx->cleanupCount);
+
+    flashCb->PartitionSize = NULL;
+    WH_TEST_ASSERT_RETURN(WH_ERROR_BADARGS ==
+                          wh_NvmFlash_Init(nvmCtx, nvmCfg));
+    WH_TEST_ASSERT_RETURN(1 == flashCtx->cleanupCount);
+    WH_TEST_ASSERT_RETURN(0 == flashCtx->accessCount);
+    WH_TEST_ASSERT_RETURN(WH_ERROR_OK == wh_NvmFlash_Cleanup(nvmCtx));
+    WH_TEST_ASSERT_RETURN(1 == flashCtx->cleanupCount);
+
+    return 0;
+}
+
+
+int whTest_NvmInitStates(void* ctx)
+{
+    whTestNvmFlashCtx* c = &_ctx;
+    uint8_t corruptImage[NVM_FLASH_SECTOR_SZ * 2] = {0};
+
+    (void)ctx;
+    _setup();
+    c->flashCfg.size = sizeof(corruptImage);
+    WH_TEST_RETURN_ON_FAIL(_selectNvm(WH_NVM_TEST_BACKEND_FLASH));
+
+    WH_TEST_RETURN_ON_FAIL(c->nvmCfg.cb->Init(c->nvmCfg.context,
+                                             c->nvmCfg.config));
+    WH_TEST_ASSERT_RETURN(0 == c->nvmSetup.nvmFlashCtx.active);
+    WH_TEST_ASSERT_RETURN(NF_STATUS_USED ==
+                          c->nvmSetup.nvmFlashCtx.state.status);
+    WH_TEST_RETURN_ON_FAIL(c->nvmCfg.cb->Cleanup(c->nvmCfg.context));
+
+    corruptImage[0]                   = 1;
+    corruptImage[NVM_FLASH_SECTOR_SZ] = 1;
+    c->flashCfg.initData              = corruptImage;
+
+    WH_TEST_RETURN_ON_FAIL(c->nvmCfg.cb->Init(c->nvmCfg.context,
+                                             c->nvmCfg.config));
+    WH_TEST_ASSERT_RETURN(0 == c->nvmSetup.nvmFlashCtx.active);
+    WH_TEST_ASSERT_RETURN(NF_STATUS_USED ==
+                          c->nvmSetup.nvmFlashCtx.state.status);
+    WH_TEST_RETURN_ON_FAIL(c->nvmCfg.cb->Cleanup(c->nvmCfg.context));
 
     return 0;
 }
@@ -450,6 +617,10 @@ static int _simulateFailureWithPrecedingObject(void)
     uint32_t      availStart    = 0;
     uint32_t      availAfter    = 0;
     uint32_t      reclaimAfter  = 0;
+    uint32_t      firstDataBytes = (uint32_t)(
+        WHFU_BYTES2UNITS(sizeof(firstData)) * WHFU_BYTES_PER_UNIT);
+    uint32_t      intrDataBytes = (uint32_t)(
+        WHFU_BYTES2UNITS(sizeof(intrData)) * WHFU_BYTES_PER_UNIT);
     whNvmId       objsStart     = 0;
     whNvmId       objsAfter     = 0;
     whNvmId       objsReclAfter = 0;
@@ -498,9 +669,9 @@ static int _simulateFailureWithPrecedingObject(void)
     WH_TEST_RETURN_ON_FAIL(cb->GetAvailable(context, &availAfter, &objsAfter,
                                             &reclaimAfter, &objsReclAfter));
     WH_TEST_ASSERT_RETURN(availAfter ==
-                          availStart - sizeof(firstData) - sizeof(intrData));
+                          availStart - firstDataBytes - intrDataBytes);
     WH_TEST_ASSERT_RETURN(objsAfter == objsStart - 2);
-    WH_TEST_ASSERT_RETURN(reclaimAfter == sizeof(intrData));
+    WH_TEST_ASSERT_RETURN(reclaimAfter == intrDataBytes);
     WH_TEST_ASSERT_RETURN(objsReclAfter == 1);
 
     /* A new add lands after both regions instead of on top of them */

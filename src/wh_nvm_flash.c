@@ -43,23 +43,32 @@ enum {
     NF_COPY_OBJECT_BUFFER_LEN = 8 * WHFU_BYTES_PER_UNIT,
 };
 
-/* MSW of state variables (nfState) must be set to this pattern when written
- * to flash to prevent hardware on certain chipsets from confusing zero values
- * with erased flash */
-#define BASE_STATE 0x1234567800000000ULL
+/* Preserve the existing uint64_t state layout on both endian orders. */
+#if defined(BIG_ENDIAN_ORDER) || defined(__BIG_ENDIAN__) || \
+    (defined(__BYTE_ORDER__) && defined(__ORDER_BIG_ENDIAN__) && \
+     (__BYTE_ORDER__ == __ORDER_BIG_ENDIAN__))
+    #define WHFU_STATE_MAGIC(_unit) ((_unit).u32[0])
+    #define WHFU_STATE_VALUE(_unit) ((_unit).u32[1])
+    #define WHFU_STATE_MAGIC16(_unit) ((_unit).u16[0])
+    #define WHFU_STATE_CRC16(_unit) ((_unit).u16[1])
+#else
+    #define WHFU_STATE_MAGIC(_unit) ((_unit).u32[1])
+    #define WHFU_STATE_VALUE(_unit) ((_unit).u32[0])
+    #define WHFU_STATE_MAGIC16(_unit) ((_unit).u16[3])
+    #define WHFU_STATE_CRC16(_unit) ((_unit).u16[2])
+#endif
+
+#define NF_STATE_MAGIC_VALUE 0x12345678U
 
 #ifdef WOLFHSM_CFG_NVM_FLASH_CRC16
 /* With CRC16 enabled, the object start and count state words carry a CRC in
  * bits [47:32], replacing the low half of the magic:
  *   start word: [63:48]=0x1234 [47:32]=CRC16(metadata) [31:0]=start
  *   count word: [63:48]=0x1234 [47:32]=CRC16(data)     [31:0]=count
- * The epoch word and all partition state words keep the full BASE_STATE
+ * The epoch word and all partition state words keep the full state
  * magic. The remaining 0x12/0x34 bytes still keep every state word distinct
  * from erased flash. */
-#define CRC_BASE_STATE 0x1234000000000000ULL
-#define NF_STATE_CRC_PACK(_crc) (((uint64_t)(uint16_t)(_crc)) << 32)
-#define NF_STATE_CRC_EXTRACT(_unit) \
-    ((uint16_t)((WHFU_TO_U64(_unit) >> 32) & 0xFFFFULL))
+#define NF_STATE_CRC_MAGIC_VALUE 0x1234U
 #endif
 
 /* On-flash layout of the state of an Object or Directory*/
@@ -165,6 +174,24 @@ static int nfIdList_Contains(whNvmId list_count, const whNvmId* id_list,
                              whNvmId id);
 
 
+static void nfStateUnit_Set(whFlashUnit* unit, uint32_t value)
+{
+    memset(unit, 0, sizeof(*unit));
+    WHFU_STATE_MAGIC(*unit) = NF_STATE_MAGIC_VALUE;
+    WHFU_STATE_VALUE(*unit) = value;
+}
+
+#ifdef WOLFHSM_CFG_NVM_FLASH_CRC16
+static void nfStateUnit_SetCrc(whFlashUnit* unit, uint32_t value, uint16_t crc)
+{
+    memset(unit, 0, sizeof(*unit));
+    WHFU_STATE_MAGIC16(*unit) = NF_STATE_CRC_MAGIC_VALUE;
+    WHFU_STATE_CRC16(*unit)   = crc;
+    WHFU_STATE_VALUE(*unit)   = value;
+}
+#endif
+
+
 static int nfMemState_Read(whNvmFlashContext* context, uint32_t offset,
         nfMemState* state)
 {
@@ -222,12 +249,12 @@ static int nfMemState_Read(whNvmFlashContext* context, uint32_t offset,
             return ret;
         }
 
-        state->epoch = (uint32_t)WHFU_TO_U64(buffer.epoch);
-        state->start = (uint32_t)WHFU_TO_U64(buffer.start);
-        state->count = (uint32_t)WHFU_TO_U64(buffer.count);
+        state->epoch = WHFU_STATE_VALUE(buffer.epoch);
+        state->start = WHFU_STATE_VALUE(buffer.start);
+        state->count = WHFU_STATE_VALUE(buffer.count);
 #ifdef WOLFHSM_CFG_NVM_FLASH_CRC16
-        state->crc_meta = NF_STATE_CRC_EXTRACT(buffer.start);
-        state->crc_data = NF_STATE_CRC_EXTRACT(buffer.count);
+        state->crc_meta = WHFU_STATE_CRC16(buffer.start);
+        state->crc_data = WHFU_STATE_CRC16(buffer.count);
 #endif
 
         /* Used */
@@ -243,10 +270,10 @@ static int nfMemState_Read(whNvmFlashContext* context, uint32_t offset,
             return ret;
         }
 
-        state->epoch = (uint32_t)WHFU_TO_U64(buffer.epoch);
-        state->start = (uint32_t)WHFU_TO_U64(buffer.start);
+        state->epoch = WHFU_STATE_VALUE(buffer.epoch);
+        state->start = WHFU_STATE_VALUE(buffer.start);
 #ifdef WOLFHSM_CFG_NVM_FLASH_CRC16
-        state->crc_meta = NF_STATE_CRC_EXTRACT(buffer.start);
+        state->crc_meta = WHFU_STATE_CRC16(buffer.start);
 #endif
         state->status = NF_STATUS_DATA_BAD;
     } else if (blank_epoch == WH_ERROR_NOTBLANK) {
@@ -442,11 +469,13 @@ static int nfPartition_ReadParseMemDirectory(whNvmFlashContext* context, int par
 static int nfPartition_ProgramEpoch(whNvmFlashContext* context,
         int partition, uint32_t epoch)
 {
-    whFlashUnit unit = WHFU_VALUE(BASE_STATE | epoch);
+    whFlashUnit unit;
 
     if ((context == NULL) || (context->cb == NULL)) {
         return WH_ERROR_BADARGS;
     }
+
+    nfStateUnit_Set(&unit, epoch);
 
     return wh_FlashUnit_Program(
             context->cb,
@@ -460,11 +489,13 @@ static int nfPartition_ProgramEpoch(whNvmFlashContext* context,
 static int nfPartition_ProgramStart(whNvmFlashContext* context,
         int partition, uint32_t start)
 {
-    whFlashUnit unit = WHFU_VALUE(BASE_STATE | start);
+    whFlashUnit unit;
 
     if ((context == NULL) || (context->cb == NULL)) {
         return WH_ERROR_BADARGS;
     }
+
+    nfStateUnit_Set(&unit, start);
 
     return wh_FlashUnit_Program(
             context->cb,
@@ -478,11 +509,13 @@ static int nfPartition_ProgramStart(whNvmFlashContext* context,
 static int nfPartition_ProgramCount(whNvmFlashContext* context,
         int partition, uint32_t count)
 {
-    whFlashUnit unit = WHFU_VALUE(BASE_STATE | count);
+    whFlashUnit unit;
 
     if ((context == NULL) || (context->cb == NULL)) {
         return WH_ERROR_BADARGS;
     }
+
+    nfStateUnit_Set(&unit, count);
 
     return wh_FlashUnit_Program(
             context->cb,
@@ -589,8 +622,8 @@ static int nfObject_ProgramBegin(whNvmFlashContext* context, int partition,
 {
     int rc = 0;
     uint32_t object_offset = 0;
-    whFlashUnit state_epoch = WHFU_VALUE(BASE_STATE | epoch);
-    whFlashUnit state_start = WHFU_VALUE(BASE_STATE | start);
+    whFlashUnit state_epoch;
+    whFlashUnit state_start;
 
     if (    (context == NULL) ||
             (context->cb == NULL) ||
@@ -598,11 +631,12 @@ static int nfObject_ProgramBegin(whNvmFlashContext* context, int partition,
         return WH_ERROR_BADARGS;
     }
 
+    nfStateUnit_Set(&state_epoch, epoch);
+
 #ifdef WOLFHSM_CFG_NVM_FLASH_CRC16
-    /* Start word carries the metadata CRC in place of the low magic half */
-    state_start = WHFU_VALUE(CRC_BASE_STATE | NF_STATE_CRC_PACK(crc_meta) |
-                             start);
+    nfStateUnit_SetCrc(&state_start, start, crc_meta);
 #else
+    nfStateUnit_Set(&state_start, start);
     (void)crc_meta;
 #endif
 
@@ -674,18 +708,16 @@ static int nfObject_ProgramFinish(whNvmFlashContext* context, int partition,
 {
     int rc;
     uint32_t object_offset = 0;
-    whFlashUnit state_count = WHFU_VALUE(BASE_STATE |
-        WHFU_BYTES2UNITS(byte_count));
+    whFlashUnit state_count;
 
     if ((context == NULL) || (context->cb == NULL)) {
         return WH_ERROR_BADARGS;
     }
 
 #ifdef WOLFHSM_CFG_NVM_FLASH_CRC16
-    /* Count word carries the data CRC in place of the low magic half */
-    state_count = WHFU_VALUE(CRC_BASE_STATE | NF_STATE_CRC_PACK(crc_data) |
-                             WHFU_BYTES2UNITS(byte_count));
+    nfStateUnit_SetCrc(&state_count, WHFU_BYTES2UNITS(byte_count), crc_data);
 #else
+    nfStateUnit_Set(&state_count, WHFU_BYTES2UNITS(byte_count));
     (void)crc_data;
 #endif
 
@@ -1050,10 +1082,7 @@ int wh_NvmFlash_Init(void* c, const void* cf)
         }
 
         if (ret != WH_ERROR_OK) {
-            if (context->cb->Cleanup != NULL) {
-                (void)context->cb->Cleanup(context->flash);
-            }
-            return ret;
+            goto exit;
         }
 
         /* Unlock the both partitions */
@@ -1109,6 +1138,11 @@ int wh_NvmFlash_Init(void* c, const void* cf)
                     context->initialized = 1;
                 }
             }
+        }
+
+exit:
+        if ((ret != WH_ERROR_OK) && (context->cb->Cleanup != NULL)) {
+            (void)context->cb->Cleanup(context->flash);
         }
     }
     return ret;
